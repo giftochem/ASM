@@ -1,0 +1,105 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-asm}
+      # No insecure fallback: docker compose refuses to start rather than
+      # silently provisioning Postgres with a guessable default password
+      # (see Step 7A remediation — this fallback used to be `change-me`).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-asm}
+    # No host port mapping: app/worker reach this over the internal
+    # compose network at db:5432 regardless. Inspect it with
+    # `docker compose exec db psql -U asm -d asm`, which needs no
+    # published port. If a host-side GUI client is genuinely needed for
+    # local development, bind it explicitly to loopback only —
+    # `"127.0.0.1:5432:5432"` — never a bare "5432:5432" (binds
+    # 0.0.0.0, reachable from any network interface on the host).
+    volumes:
+      - asm_pgdata:/var/lib/postgresql/data
+      # Step 7C: auto-creates asm_test (TEST_DATABASE_URL's target) on a
+      # fresh volume — see the file for why this was needed. Postgres
+      # only runs *.sql files here on first init against an empty data
+      # dir, so this is a no-op against the existing dev volume.
+      - ./docker/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-asm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # No host port mapping — see the identical note on `db` above. Redis
+    # backs both the Celery broker and the rate limiter/lockout counters;
+    # it has no authentication configured, so it must never be reachable
+    # from outside the compose network.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.celery_app worker --loglevel=info
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    # Step 9.11: exactly one process type whose only job is ticking
+    # celery_app.conf.beat_schedule (dispatch_due_discovery_schedules)
+    # -- running more than one `beat` replica is a known Celery
+    # misconfiguration (duplicate ticks), so this service must never be
+    # scaled, unlike `worker`, which safely can be.
+    command: celery -A app.celery_app beat --loglevel=info
+
+volumes:
+  asm_pgdata:

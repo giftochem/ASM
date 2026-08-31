@@ -1,0 +1,15 @@
+# Step 7C release-readiness fix: without this, `COPY . .` in
+# docker/backend/Dockerfile bakes in whatever happens to exist on the
+# HOST at build time -- confirmed this was actually happening: a built
+# image contained real locally-generated scan reports (reports/) and a
+# .pytest_cache from local test runs. Neither belongs in an image that
+# might get pushed to a registry.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+reports/
+.env
+.env.*
+.git/

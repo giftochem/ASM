@@ -1,0 +1,57 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Environment files: only .env.example (placeholders) may be tracked ---
+.env
+.env.*
+!.env.example
+
+# --- Local databases ---
+*.db
+*.sqlite
+*.sqlite3
+
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.idea/
+.vscode/
+*.log
+logs/
+backend/reports/
+node_modules/
+
+# --- OS metadata ---
+.DS_Store
+Thumbs.db
+
+# --- Celery beat runtime schedule state (local dev/prod artifact, never
+# meaningful to commit — see docker-compose.yml's `beat` service) ---
+celerybeat-schedule
+**/celerybeat-schedule
+
+# --- TLS/private key material: must never be committed, wherever it's
+# generated (see docker/nginx/generate-self-signed-cert.ps1) ---
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Step 7B: self-signed (or any) TLS private key/cert for local nginx —
+# never committed, same principle as .env. (frontend/dist/ is already
+# covered by the generic `dist/` pattern above.) Kept explicit alongside
+# the generic *.pem/*.key patterns above since this is the one path
+# they're actually generated into.
+docker/nginx/certs/
+
+# Step 7C: a build-log transcript from local debugging was accidentally
+# tracked (docker/build-log.txt, removed in this pass) — this pattern
+# stops that specific mistake from recurring.
+docker/*build-log*.txt
