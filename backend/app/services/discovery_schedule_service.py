@@ -76,8 +76,18 @@ def create_schedule(
 def update_schedule(
     db: Session, schedule: DiscoverySchedule, *, enabled: bool | None = None, interval_hours: int | None = None
 ) -> DiscoverySchedule:
+    # Everything is validated before anything is mutated, so a rejected
+    # request never leaves a half-applied change on the session.
     if interval_hours is not None:
         _validate_interval(interval_hours)
+    if enabled and get_provider(schedule.provider_name) is None:
+        # A schedule whose provider isn't available in this deployment
+        # (e.g. one created for the test-only `stub` provider) can never
+        # execute, so re-enabling it is refused rather than allowed to
+        # fail on every tick. Disabling it is still allowed.
+        raise ValueError(f"unknown discovery provider: '{schedule.provider_name}'")
+
+    if interval_hours is not None:
         schedule.interval_hours = interval_hours
 
     if enabled is not None:

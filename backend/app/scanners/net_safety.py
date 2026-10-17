@@ -13,6 +13,7 @@ import socket
 from dataclasses import dataclass
 
 from app.config import settings
+from app.core.validation import SHARED_ADDRESS_SPACE
 
 _BLOCKED_HOSTNAME_LITERALS = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
 
@@ -56,6 +57,11 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | N
             return f"{candidate} is a reserved address"
         if candidate.is_unspecified:
             return f"{candidate} is the unspecified address"
+        # Python's ipaddress doesn't flag RFC 6598 shared address space
+        # (CGNAT, 100.64.0.0/10) as private or reserved -- it needs its own
+        # check. See app.core.validation.SHARED_ADDRESS_SPACE.
+        if candidate.version == 4 and candidate in SHARED_ADDRESS_SPACE:
+            return f"{candidate} is a shared address space (CGNAT, RFC 6598) address"
     return None
 
 

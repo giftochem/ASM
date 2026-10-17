@@ -1,29 +1,41 @@
 """Real FastAPI -> Redis -> Celery worker -> PostgreSQL integration test.
 
-Deliberately does NOT use the FastAPI TestClient or the test database —
-it makes real HTTP calls against the persistent `app` service, which
-shares its (dev) database with the persistent `worker` service. That's
-required for this to be a genuine test of the real pipeline: a separate
-worker process can't see rows created through the TestClient's
-test-database-scoped session, so this is the one place in the suite that
-intentionally talks to the "real" stack instead of the isolated test one.
+OPT-IN ONLY. Deliberately does NOT use the FastAPI TestClient or the test
+database — it makes real HTTP calls against the persistent `app` service,
+which shares its (dev) database with the persistent `worker` service.
+That's required for this to be a genuine test of the real pipeline: a
+separate worker process can't see rows created through the TestClient's
+test-database-scoped session.
 
+Because of that it has side effects no other test has: it registers a new
+organization and user in the DEVELOPMENT database, and the live worker
+performs a real DNS scan (real outbound DNS lookups) of a random,
+never-registered domain. So it is skipped in ordinary runs and only runs
+when explicitly requested:
+
+    docker compose run --rm -e ASM_RUN_LIVE_STACK_TESTS=1 app pytest tests/test_celery_integration.py
+
+Once opted in, an unreachable stack is a hard failure, not a skip.
 Requires `docker compose up -d db redis app worker` to be running first.
-Skips (does not fail) if that stack isn't reachable — UNLESS
-REQUIRE_CELERY_INTEGRATION=1 is set, in which case an unreachable stack
-is a hard failure rather than a silent skip. Use that in CI/whenever you
-want an infra outage to be caught, not hidden.
 """
 
-import os
 import time
 import uuid
 
 import httpx
 import pytest
 
-_BASE_URL = os.environ.get("ASM_INTEGRATION_BASE_URL", "http://app:8000")
-_REQUIRE_INTEGRATION = os.environ.get("REQUIRE_CELERY_INTEGRATION", "").lower() in ("1", "true", "yes")
+from tests import isolation
+
+pytestmark = pytest.mark.skipif(
+    not isolation.live_stack_tests_enabled(),
+    reason=(
+        f"opt-in live-stack test (set {isolation.LIVE_STACK_OPT_IN_ENV}=1): writes to the development "
+        "database and runs a real DNS scan through the live worker"
+    ),
+)
+
+_BASE_URL = isolation.live_stack_base_url()
 _POLL_TIMEOUT_SECONDS = 30
 _POLL_INTERVAL_SECONDS = 1.0
 
@@ -33,13 +45,10 @@ def _check_stack_reachable() -> None:
         resp = httpx.get(f"{_BASE_URL}/health", timeout=3.0)
         resp.raise_for_status()
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
-        message = (
+        pytest.fail(
             f"Could not reach live app stack at {_BASE_URL} ({exc}). "
             "Run `docker compose up -d db redis app worker` first."
         )
-        if _REQUIRE_INTEGRATION:
-            pytest.fail(message)
-        pytest.skip(message)
 
 
 @pytest.fixture

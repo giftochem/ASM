@@ -1,21 +1,102 @@
-import redis as redis_lib
 import pytest
+import redis as redis_lib
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.database import get_db
-from app.main import app
-from app.models import Base
+from tests import isolation
 
-test_engine = create_engine(settings.test_database_url or settings.database_url)
+# --- Fail-closed isolation (see tests/isolation.py) ------------------------
+# Applied at import time, BEFORE any other `app` module is imported: the
+# DB engine (app/database.py), Celery broker (app/celery_app.py), rate-limit
+# storage (app/services/rate_limit.py) and lockout client
+# (app/services/account_lockout.py) all bind to settings when imported.
+# Repointing settings here means the whole test process -- including
+# executors that open database.SessionLocal() directly -- can only ever
+# reach the isolated test database and test Redis DB, never development
+# data or the live Celery broker.
+try:
+    _TEST_DATABASE_URL = isolation.validated_test_database_url(
+        settings.test_database_url, settings.database_url, settings.environment
+    )
+    _TEST_REDIS_URL = isolation.isolated_test_redis_url(settings.redis_url, settings.test_redis_url)
+    # Last, and only once the URL rules pass: a read-only check that the
+    # database actually reached is explicitly marked as disposable.
+    isolation.verify_test_database_marker(_TEST_DATABASE_URL)
+except isolation.UnsafeTestConfiguration as exc:
+    pytest.exit(f"Refusing to run the test suite: {exc}", returncode=pytest.ExitCode.USAGE_ERROR)
+
+# Where the app would have gone without the overrides -- recorded
+# (host/port/name only, no credentials) so tests can prove the redirect
+# below actually took effect.
+LIVE_DATABASE_TARGET = isolation.database_target(settings.database_url)
+LIVE_REDIS_TARGET = isolation.redis_target(settings.redis_url)
+
+settings.database_url = _TEST_DATABASE_URL
+settings.redis_url = _TEST_REDIS_URL
+
+from app.database import get_db  # noqa: E402 -- must follow the isolation overrides above
+from app.main import app  # noqa: E402
+from app.models import Base  # noqa: E402
+
+test_engine = create_engine(_TEST_DATABASE_URL)
 TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+_network_guard = isolation.NetworkGuard(allowed_hostnames=isolation.allowed_test_hostnames(_TEST_REDIS_URL))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _block_real_network_access():
+    """Ordinary test runs must never reach the real network -- no real
+    DNS, no connections beyond loopback test servers and the test Redis.
+    See isolation.NetworkGuard."""
+    with pytest.MonkeyPatch.context() as session_monkeypatch:
+        _network_guard.install(session_monkeypatch)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_real_network_access():
+    """Fails any test that tried to reach the real network, even if the
+    code under test swallowed the RealNetworkAccessBlocked it got."""
+    _network_guard.blocked_attempts.clear()
+    yield
+    if _network_guard.blocked_attempts:
+        attempts = "; ".join(_network_guard.blocked_attempts)
+        _network_guard.blocked_attempts.clear()
+        pytest.fail(f"test attempted real network access (blocked): {attempts}", pytrace=False)
+
+
+@pytest.fixture
+def network_guard():
+    """The session's NetworkGuard, for tests that verify the guard itself
+    (they must clear blocked_attempts for anything they trigger on purpose)."""
+    return _network_guard
+
+
+@pytest.fixture
+def live_targets():
+    """Where DATABASE_URL/REDIS_URL pointed before the isolation overrides
+    -- (host, port, name/index) only, never credentials. Exposed as a
+    fixture because test modules must never import conftest directly."""
+    return {"database": LIVE_DATABASE_TARGET, "redis": LIVE_REDIS_TARGET}
+
+
+@pytest.fixture(autouse=True)
+def _enable_test_only_discovery_providers(monkeypatch):
+    """The `stub` provider is unavailable unless explicitly enabled. Many
+    pipeline tests rely on it as a deterministic provider, so each test
+    starts with it enabled -- tests of the disabled behavior turn it back
+    off with their own monkeypatch."""
+    monkeypatch.setattr(settings, "enable_test_discovery_providers", True)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _create_schema():
+    isolation.assert_is_test_database(test_engine.url)
     Base.metadata.create_all(bind=test_engine)
     yield
+    isolation.assert_is_test_database(test_engine.url)
     Base.metadata.drop_all(bind=test_engine)
 
 
@@ -26,13 +107,11 @@ def _reset_rate_limits():
     this, cumulative /auth/login (etc.) calls across the many test files
     that authenticate would eventually trip the real 5/minute limit on
     tests that have nothing to do with rate limiting, causing flaky
-    unrelated failures. Flushing the whole Redis DB is safe here: this
-    Redis instance is dev/test-only infrastructure (Celery broker +
-    rate-limit storage), not a store of anything that needs to survive
-    across test boundaries. Safe for test_celery_integration.py too,
-    since it flushes only at clean before/after-test boundaries, never
-    mid-test against the live worker.
+    unrelated failures. Flushes only the isolated test Redis DB (see the
+    overrides at the top of this file) -- re-checked here so it can never
+    flush the live Celery broker's DB.
     """
+    isolation.assert_not_live_redis(settings.redis_url, LIVE_REDIS_TARGET)
     client = redis_lib.Redis.from_url(settings.redis_url)
     client.flushdb()
     yield
@@ -44,6 +123,7 @@ def _clean_tables():
     each time — much faster against a real Postgres instance.
     """
     yield
+    isolation.assert_is_test_database(test_engine.url)
     with test_engine.begin() as conn:
         table_names = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
         conn.execute(text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE"))
@@ -79,11 +159,10 @@ def client():
 @pytest.fixture
 def executor_uses_test_db(monkeypatch):
     """scan_executor.execute_scan opens its own DB session (it has to, for
-    real Celery worker use — no request-scoped session to borrow there),
-    which by default resolves against the dev database. Any test that
-    invokes execution — directly, or indirectly via a Celery task running
-    in eager mode — needs this, or it'll silently operate on the wrong
-    database.
+    real Celery worker use — no request-scoped session to borrow there).
+    The isolation overrides at the top of this file already point
+    app.database at the test database for the whole run; this keeps such
+    sessions on the very same TestSessionLocal the `db` fixture uses.
     """
     monkeypatch.setattr("app.database.SessionLocal", TestSessionLocal)
     yield

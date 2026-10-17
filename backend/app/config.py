@@ -3,6 +3,16 @@ from functools import lru_cache
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Environments where test tooling may run: the pytest suite and the
+# test-only discovery providers. An allowlist rather than a
+# "!= production" check, so an unexpected or misspelled value ("prod",
+# "Production", "staging", empty) fails closed.
+TEST_TOOLING_ENVIRONMENTS = frozenset({"development", "test"})
+
+
+def is_test_tooling_environment(environment: str | None) -> bool:
+    return (environment or "").strip().lower() in TEST_TOOLING_ENVIRONMENTS
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -10,9 +20,15 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     database_url: str
+    # Required by the pytest suite, which refuses to run without it (no
+    # fallback to database_url -- see tests/isolation.py).
     test_database_url: str | None = None
 
     redis_url: str = "redis://localhost:6379/0"
+    # Optional: the Redis URL the pytest suite uses. When unset, tests
+    # derive an isolated one from redis_url (same server, a dedicated DB
+    # index) -- never the live Celery broker's DB. See tests/isolation.py.
+    test_redis_url: str | None = None
 
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
@@ -80,6 +96,17 @@ class Settings(BaseSettings):
     # authorization/RBAC/rate-limit posture as scans, just for a
     # different kind of execution (Step 9.1).
     rate_limit_discovery_create: str = "20/minute"
+
+    # --- Test-only discovery providers ---
+    # The `stub` provider fabricates a deterministic `www.` candidate with
+    # no real evidence behind it -- it exists only to exercise the
+    # discovery pipeline in tests. Off by default: while off, it is absent
+    # from the provider catalog and rejected by every run/schedule path,
+    # exactly like an unknown provider. Even when on, it is only available
+    # in a TEST_TOOLING_ENVIRONMENTS environment (never production, or any
+    # unrecognized ENVIRONMENT value). tests/conftest.py turns it on for
+    # the test session only.
+    enable_test_discovery_providers: bool = False
 
     # --- Alerting & notifications (Step 9.12) ---
     # Disabled by default -- a deployment that hasn't configured SMTP

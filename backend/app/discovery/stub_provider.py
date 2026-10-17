@@ -10,10 +10,17 @@ class StubDiscoveryProvider(DiscoveryProvider):
 
     Given a domain/subdomain seed, always reports exactly one candidate:
     a `www.` subdomain of the seed, related back to it via `belongs_to`.
+
+    TEST-ONLY: its candidate has no real evidence behind it, so it must
+    never produce assets in a real organization. Unavailable (absent from
+    the catalog, rejected by every run/schedule path) unless
+    settings.enable_test_discovery_providers is explicitly on -- see
+    app/discovery/registry.py.
     """
 
     name = "stub"
     applicable_seed_types = {AssetType.domain, AssetType.subdomain}
+    test_only = True
 
     def discover(self, seed_value: str) -> DiscoveryProviderResult:
         candidate = DiscoveryCandidate(

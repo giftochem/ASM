@@ -196,7 +196,16 @@ def test_dependency_unmet_skips_run_without_disabling(client, register_user, db,
     assert schedule.claimed_at is None  # released for an immediate retry, not a full interval
 
 
-def test_dependency_satisfied_allows_run(client, register_user, db, executor_uses_test_db):
+def test_dependency_satisfied_allows_run(client, register_user, db, executor_uses_test_db, monkeypatch):
+    from app.discovery.base import DiscoveryProviderResult
+
+    # What's under test is the dependency gate, not the provider -- the
+    # real cloud provider would make live Team Cymru DNS lookups.
+    def _no_network(self, seed_value):
+        return DiscoveryProviderResult(provider="cloud", candidates=[])
+
+    monkeypatch.setattr(type(DISCOVERY_PROVIDER_REGISTRY["cloud"]), "discover", _no_network)
+
     headers = register_user(email="exec-dependency-ok@example.com")
     seed_asset, schedule = _make_schedule(
         db, client, headers, "exec-dependency-ok@example.com", "93.184.216.202",

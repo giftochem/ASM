@@ -13,3 +13,10 @@
 -- from before this fix, run manually instead:
 --   docker compose exec db psql -U asm -d asm -c "CREATE DATABASE asm_test;"
 CREATE DATABASE asm_test;
+
+-- The explicit "disposable test database" marker the pytest suite
+-- requires before it will truncate/drop anything (tests/isolation.py,
+-- verify_test_database_marker). Set here, at provisioning time -- never by
+-- the suite itself. For a pre-existing volume, mark it once manually:
+--   docker compose exec db psql -U asm -d asm_test -c "COMMENT ON DATABASE asm_test IS 'asm-disposable-test-database';"
+COMMENT ON DATABASE asm_test IS 'asm-disposable-test-database';

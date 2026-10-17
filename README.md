@@ -160,7 +160,13 @@ proves the architecture end to end. **Web3 discovery is not implemented.**
   contract `ScanModuleResult` already uses). `StubDiscoveryProvider`
   (`app/discovery/stub_provider.py`) is the one registered provider: zero
   network I/O, deterministically reports one `www.` subdomain candidate
-  for a domain/subdomain seed. Future providers (DNS, subdomain
+  for a domain/subdomain seed. **It is now test-only**: because its
+  candidate has no real evidence behind it, it is absent from the
+  provider catalog and rejected by every run/schedule path unless
+  `ENABLE_TEST_DISCOVERY_PROVIDERS` is explicitly on, and never available
+  with `ENVIRONMENT=production`; an existing stub schedule is disabled
+  with an explicit reason the next time it comes due, its history kept.
+  The test suite enables it for itself. Future providers (DNS, subdomain
   enumeration, certificate-transparency, HTTP, ASN/cloud/repository
   enrichment, and eventually Web3) register the same way, without
   touching the orchestration layer.
@@ -1467,10 +1473,11 @@ convenient-but-unrealistic default. Tests that need deterministic,
 synchronous completion opt in explicitly via the `eager_celery` pytest
 fixture. A separate integration test
 (`tests/test_celery_integration.py`) exercises the real broker/worker
-over actual HTTP against the persistent `app`/`worker` services — it
-skips if that stack isn't running, or hard-fails instead of skipping when
-`REQUIRE_CELERY_INTEGRATION=1` is set (so an infra outage can't silently
-look like a clean test run in a stricter CI mode).
+over actual HTTP against the persistent `app`/`worker` services. Because
+it writes to the development database and runs a real DNS scan, it is
+**opt-in**: skipped unless `ASM_RUN_LIVE_STACK_TESTS=1` is set, and once
+opted in an unreachable stack is a hard failure, not a skip. See
+"Running tests" below.
 
 ## Tech stack
 
@@ -1686,16 +1693,50 @@ curl "http://localhost:8000/audit-logs?action=scan.execute&limit=50" -b cookies.
 
 Backend:
 ```bash
-docker compose up -d db redis app worker beat   # worker+beat needed for the real Celery integration and scheduler tests
+docker compose up -d db redis        # all the ordinary suite needs
 docker compose run --rm app pytest
 ```
 
-Without `app`/`worker` running, everything still passes — the one real
-Celery-integration test skips (see "Testing" above). To make an
-unreachable stack a hard failure instead of a skip:
+The suite is fail-safe by construction — `tests/isolation.py`, applied at
+the top of `tests/conftest.py` before any app module is imported:
+
+- **Environment**: the suite only runs with `ENVIRONMENT` set to
+  `development` or `test` — an allowlist, so `production`, `prod`,
+  `staging` or anything unexpected refuses to start.
+- **Database**: `TEST_DATABASE_URL` is required (there is no fallback to
+  `DATABASE_URL`) and must name a dedicated database following the strict
+  `<name>_test` convention (e.g. `asm_test`). If it names the same
+  database as `DATABASE_URL` the suite refuses, whatever the hostnames —
+  different hostnames, IPs or ports can reach the same server. On top of
+  those rules, the database it actually reaches must carry an explicit
+  marker set at provisioning time: fresh volumes get it from
+  `docker/postgres/init-test-db.sql`; mark a pre-existing test database
+  once with
+  `docker compose exec db psql -U asm -d asm_test -c "COMMENT ON DATABASE asm_test IS 'asm-disposable-test-database';"`.
+  The whole test process — including executors that open their own
+  sessions — is pointed at that database, and every TRUNCATE/DROP
+  re-checks it first.
+- **Redis**: tests use their own Redis DB — `REDIS_URL`'s server with DB
+  index 15, or `TEST_REDIS_URL` if set — whose index must differ from
+  `REDIS_URL`'s regardless of host (hostnames can alias one server; a
+  different index is a different database). Running tests next to a
+  running stack can't flush or feed the live broker.
+- **Network**: real DNS resolution, DNS traffic, and connections beyond
+  loopback test servers and the test Redis are blocked for the whole
+  session, and any test that attempts them fails — an ordinary run
+  performs no real discovery or scanning. New tests must mock the network
+  boundary.
+- **Test-only provider**: the suite enables the `stub` discovery provider
+  for itself (`ENABLE_TEST_DISCOVERY_PROVIDERS`); it stays unavailable
+  everywhere else.
+
+The one live-stack test (`tests/test_celery_integration.py`) is opt-in: it
+registers an organization in the **development** database and has the
+live worker run a real DNS scan.
 
 ```bash
-docker compose run --rm -e REQUIRE_CELERY_INTEGRATION=1 app pytest tests/test_celery_integration.py
+docker compose up -d db redis app worker
+docker compose run --rm -e ASM_RUN_LIVE_STACK_TESTS=1 app pytest tests/test_celery_integration.py
 ```
 
 Frontend:
@@ -1806,9 +1847,15 @@ accuracy, and a dependency/security scan.
 
 ## Known, disclosed debt (not silently shipped, not yet addressed)
 
-- `ssl_module.py` (Phase 1) still connects via a direct socket without
-  the same pre-resolution IP validation `net_safety`/`pinned_transport`
-  provide elsewhere (flagged at the end of Phase 2, still not addressed).
+- `ssl_module.py` (Phase 1) used to connect via a direct socket without
+  the pre-resolution IP validation `net_safety`/`pinned_transport`
+  provide elsewhere — **resolved**: every connection it makes now goes
+  through `net_safety.resolve_and_validate` first (allowed ports only;
+  every resolved address checked against the private/loopback/
+  link-local/reserved/multicast rules) and is pinned to a validated IP
+  with the real hostname still sent as SNI, including the second,
+  deprecated-TLS probe connection. Covered by `tests/test_ssl_module.py`
+  (the module previously had no dedicated tests).
 - The port scanner intentionally does not support `ip_range` assets yet
   (single-host only) — see `port_scanner_module.py`'s docstring.
 - Rate limiting is uniform per-route (e.g. all of `/scans` creation
@@ -1929,17 +1976,19 @@ accuracy, and a dependency/security scan.
   hostname-pattern concept or DB access inside providers, neither of
   which exists yet. Flagged as a found architectural gap, not silently
   worked around.
-- `app.core.validation.validate_ip_address`/`net_safety._is_blocked_ip`
-  do not classify CGNAT / Shared Address Space (`100.64.0.0/10`, RFC
-  6598) as unsafe — Python's `ipaddress` module doesn't set `is_private`
-  or `is_reserved` for this range, so it passes today's checks. Found
-  while verifying the `network` provider's defense-in-depth IP check
-  against every category Python's `ipaddress` module exposes; not fixed
-  here since it's pre-existing, shared validation code the `network`
-  provider only reuses (touching it is out of this step's scope), and
-  CGNAT space is occasionally used as a real (if unusual) public-facing
-  range by some ISPs, so "reserved and therefore always blocked" isn't
-  unambiguously correct either. Documented, not silently shipped.
+- CGNAT / Shared Address Space (`100.64.0.0/10`, RFC 6598) used to pass
+  `app.core.validation.validate_ip_address`/`validate_ip_range` and
+  `net_safety._is_blocked_ip`, since Python's `ipaddress` module sets
+  neither `is_private` nor `is_reserved` for it — **resolved**: both now
+  block it explicitly from one shared definition
+  (`app.core.validation.SHARED_ADDRESS_SPACE`). It isn't globally
+  routable, so it can never be an externally visible asset, and some
+  cloud platforms serve internal endpoints from it (Alibaba Cloud's
+  instance metadata service is `100.100.100.200`). Applies to asset
+  creation, discovery candidates, and every outbound consumer — HTTP
+  discovery and the HTTP-based scanner modules, certificate discovery,
+  SSL scanning, port scanning, and the network provider's seed check —
+  covered by `tests/test_ssrf_address_policy.py`.
 - The `network` provider makes two DNS queries per successful ASN
   lookup (origin, then AS-name) plus one independent PTR query — Team
   Cymru's own service is split into two lookups by design (the origin
@@ -2053,7 +2102,7 @@ accuracy, and a dependency/security scan.
 
 ```
 docker compose run --rm app pytest
-================= 709 passed, 0 failed, 0 skipped =================
+================= 763 passed, 1 skipped, 0 failed =================
 
 cd frontend && npx vitest run
 ================= 47 test files, 285 tests passed =================
@@ -2062,9 +2111,9 @@ cd frontend && npm run build
 ================= tsc --noEmit && vite build -- succeeds =================
 ```
 
-Backend count includes the real Celery/Redis/Postgres integration test
-when the `app`/`worker` containers are up (not skipped in that case),
-`tests/test_discovery_scheduler_concurrency.py`'s four genuine-Postgres
+The one skip is the opt-in live-stack test (`tests/test_celery_integration.py`,
+see "Running tests"); with `ASM_RUN_LIVE_STACK_TESTS=1` it runs too. The
+backend count includes `tests/test_discovery_scheduler_concurrency.py`'s four genuine-Postgres
 discovery-schedule concurrency tests, and
 `tests/test_alert_concurrency.py`'s two genuine-Postgres alert-dedup
 concurrency tests (real threads, real database sessions, no mocking of

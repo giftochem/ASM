@@ -227,6 +227,12 @@ class DiscoveryProvider(ABC):
     # detection needed for a plain set of names checked by simple
     # existence query.
     depends_on: ClassVar[set[str]] = set()
+    # True for a provider that fabricates data purely to exercise the
+    # pipeline in tests (the `stub` provider). Such a provider is
+    # unavailable unless settings.enable_test_discovery_providers is
+    # explicitly on (and never in production) -- availability is decided
+    # in app/discovery/registry.py, not by callers.
+    test_only: ClassVar[bool] = False
 
     def supports(self, asset_type: AssetType) -> bool:
         return asset_type in self.applicable_seed_types

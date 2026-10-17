@@ -26,6 +26,24 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 # ceiling until this whole cap moves to a per-organization setting.
 _MAX_IPV6_RANGE_PREFIX_LENGTH = 64
 
+# RFC 6598 Shared Address Space (carrier-grade NAT). Not globally
+# routable, so never an externally visible asset -- and Python's ipaddress
+# module classifies it as neither private nor reserved, so it needs an
+# explicit check. Some cloud platforms serve internal endpoints from it
+# (Alibaba Cloud's instance metadata service is 100.100.100.200), which
+# makes it an SSRF target, not just an unusual range. Also used by
+# app.scanners.net_safety, so asset validation and connection-time checks
+# can't drift apart.
+SHARED_ADDRESS_SPACE = ipaddress.IPv4Network("100.64.0.0/10")
+
+# IPv4-mapped IPv6 (::ffff:a.b.c.d) is just an IPv4 address in IPv6
+# notation. Python 3.12+ classifies it by the embedded IPv4, so a form like
+# ::ffff:100.100.100.200 matches none of the is_* properties and would slip
+# past an IPv4-only rule such as the CGNAT check -- and it would duplicate
+# the plain IPv4 asset anyway. Refused as an asset value; register the
+# IPv4 address itself.
+_IPV4_MAPPED_SPACE = ipaddress.IPv6Network("::ffff:0:0/96")
+
 
 def normalize_hostname(value: str) -> str:
     return value.strip().rstrip(".").lower()
@@ -55,6 +73,10 @@ def validate_ip_address(value: str) -> str:
         ip = ipaddress.ip_address(value)
     except ValueError as exc:
         raise InvalidTargetError(f"'{value}' is not a valid IP address") from exc
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        raise InvalidTargetError(
+            f"'{value}' is an IPv4-mapped IPv6 address; register the IPv4 address ({ip.ipv4_mapped}) itself"
+        )
     # ASM's whole premise is externally visible assets — private/link-
     # local/reserved addresses aren't externally reachable at all, and
     # (as of Phase 3a) accepting one here is what would let the port
@@ -68,10 +90,11 @@ def validate_ip_address(value: str) -> str:
         or ip.is_private
         or ip.is_link_local
         or ip.is_reserved
+        or (ip.version == 4 and ip in SHARED_ADDRESS_SPACE)
     ):
         raise InvalidTargetError(
-            f"'{value}' is a loopback/private/link-local/multicast/reserved/unspecified "
-            "address and is not a valid external asset target"
+            f"'{value}' is a loopback/private/link-local/multicast/reserved/unspecified/"
+            "shared-address-space (CGNAT) address and is not a valid external asset target"
         )
     return str(ip)
 
@@ -87,6 +110,10 @@ def validate_ip_range(value: str, max_ipv4_prefix_length: int) -> str:
         network = ipaddress.ip_network(value, strict=True)
     except ValueError as exc:
         raise InvalidTargetError(f"'{value}' is not a valid CIDR range") from exc
+    if network.version == 6 and network.overlaps(_IPV4_MAPPED_SPACE):
+        raise InvalidTargetError(
+            f"'{value}' overlaps IPv4-mapped IPv6 space (::ffff:0:0/96); register IPv4 ranges in IPv4 form"
+        )
 
     if (
         network.is_loopback
@@ -95,10 +122,11 @@ def validate_ip_range(value: str, max_ipv4_prefix_length: int) -> str:
         or network.is_private
         or network.is_link_local
         or network.is_reserved
+        or (network.version == 4 and network.overlaps(SHARED_ADDRESS_SPACE))
     ):
         raise InvalidTargetError(
             f"'{value}' falls within a loopback/private/link-local/multicast/reserved/"
-            "unspecified range and is not a valid external asset target"
+            "unspecified/shared-address-space (CGNAT) range and is not a valid external asset target"
         )
 
     cap = max_ipv4_prefix_length if network.version == 4 else _MAX_IPV6_RANGE_PREFIX_LENGTH

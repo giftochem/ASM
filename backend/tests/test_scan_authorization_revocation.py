@@ -102,10 +102,23 @@ def test_cancelling_queued_scan_blocks_execution(client, register_user, db, exec
     assert scan.status == ScanStatus.cancelled
 
 
-def test_scan_still_executes_when_nothing_changed(client, register_user, db, executor_uses_test_db):
+def test_scan_still_executes_when_nothing_changed(client, register_user, db, executor_uses_test_db, monkeypatch):
     """Sanity check: the fail-closed checks don't block a legitimate,
     still-authorized scan.
     """
+    from app.scanners.base import ScanModuleResult
+    from app.scanners.whois_module import WhoisModule
+
+    # What's under test is the authorization gate, not WHOIS -- the real
+    # module would query live WHOIS servers (whois.iana.org and onward).
+    executed_targets: list[str] = []
+
+    def _no_network(self, target):
+        executed_targets.append(target)
+        return ScanModuleResult(module="whois")
+
+    monkeypatch.setattr(WhoisModule, "run", _no_network)
+
     headers = register_user()
     asset_payload = _create_and_confirm_asset(client, headers)
 
@@ -118,9 +131,5 @@ def test_scan_still_executes_when_nothing_changed(client, register_user, db, exe
     scan_executor.execute_scan(scan.id)
 
     db.refresh(scan)
-    assert scan.status in (ScanStatus.completed, ScanStatus.failed)
-    # If it failed here it must be because the module itself errored
-    # (e.g. no network in the test environment), not the auth gate.
-    if scan.status == ScanStatus.failed:
-        assert "revoked" not in (scan.error_message or "").lower()
-        assert "deactivated" not in (scan.error_message or "").lower()
+    assert scan.status == ScanStatus.completed
+    assert executed_targets == ["example.com"]  # the module really was run, not skipped by the gate

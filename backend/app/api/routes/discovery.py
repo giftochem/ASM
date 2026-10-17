@@ -8,7 +8,7 @@ from app.core.enums import UserRole
 from app.core.exceptions import AuthorizationNotConfirmedError
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
-from app.discovery.registry import DISCOVERY_PROVIDER_REGISTRY
+from app.discovery.registry import available_providers, get_provider
 from app.models.asset import Asset
 from app.models.discovery_result import DiscoveryResult
 from app.models.discovery_run import DiscoveryRun
@@ -30,7 +30,9 @@ def list_providers(current_user: User = Depends(get_current_user)) -> list[Disco
     frontend-side. No role restriction, matching every other read
     endpoint in this router; `current_user` is required only for
     authentication, not used otherwise (this data is identical across
-    every organization).
+    every organization). Lists only providers available in this
+    deployment -- a test-only provider (e.g. `stub`) is absent unless
+    explicitly enabled (see app/discovery/registry.py).
     """
     return [
         DiscoveryProviderInfo(
@@ -38,7 +40,7 @@ def list_providers(current_user: User = Depends(get_current_user)) -> list[Disco
             applicable_seed_types=sorted(provider.applicable_seed_types, key=lambda t: t.value),
             depends_on=sorted(provider.depends_on),
         )
-        for provider in sorted(DISCOVERY_PROVIDER_REGISTRY.values(), key=lambda p: p.name)
+        for provider in sorted(available_providers(), key=lambda p: p.name)
     ]
 
 
@@ -224,6 +226,15 @@ def trigger_schedule(
     schedule = _get_org_schedule_or_404(db, schedule_id, current_user.organization_id)
     if not schedule.enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Schedule is disabled")
+    # Rejected before anything is claimed or queued: a schedule whose
+    # provider isn't available here (e.g. one created for the test-only
+    # `stub` provider) must never get a run. The same message
+    # validate_discovery_request uses, so it reads as "no such provider".
+    if get_provider(schedule.provider_name) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown discovery provider: '{schedule.provider_name}'",
+        )
 
     run = discovery_scheduler_executor.claim_schedule_now(db, schedule)
     if run is None:

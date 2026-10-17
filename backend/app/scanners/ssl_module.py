@@ -7,6 +7,7 @@ from cryptography import x509
 from cryptography.x509.oid import ExtensionOID
 
 from app.core.enums import AssetType, FindingSeverity
+from app.scanners import net_safety
 from app.scanners.base import ScanFinding, ScanModuleResult, ScannerModule
 
 _CONNECT_TIMEOUT_SECONDS = 5.0
@@ -21,24 +22,52 @@ def _target_host_port(target: str) -> tuple[str, int]:
     return target, _DEFAULT_PORT
 
 
-def _fetch_certificate(host: str, port: int) -> tuple[x509.Certificate, str | None, str | None]:
+def _connect_pinned(validated_ips: list[str], port: int) -> tuple[socket.socket, str]:
+    """Dials only addresses net_safety.resolve_and_validate already
+    approved -- the hostname is never resolved again here, so a DNS
+    answer that changes after validation (rebinding) can't redirect the
+    connection. Tries each in resolution order, as socket.create_connection
+    does for a hostname, so a multi-address host whose first address is
+    unreachable is still inspected. Returns the socket and the IP it
+    reached."""
+    last_error: OSError | None = None
+    for ip in validated_ips:
+        try:
+            return socket.create_connection((ip, port), timeout=_CONNECT_TIMEOUT_SECONDS), ip
+        except OSError as exc:
+            last_error = exc
+    raise last_error if last_error is not None else OSError("no validated address to connect to")
+
+
+def _fetch_certificate(
+    host: str, port: int, validated_ips: list[str]
+) -> tuple[x509.Certificate, str | None, str | None, str]:
+    """Connects to a validated IP while still sending `host` as SNI --
+    the same pinning approach as app.discovery.certificate_provider and
+    pinned_transport.py: only which IP the TCP layer dials is pinned,
+    certificate inspection itself is unchanged."""
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT_SECONDS) as sock:
+    sock, connected_ip = _connect_pinned(validated_ips, port)
+    with sock:
         with context.wrap_socket(sock, server_hostname=host) as tls_sock:
             der_cert = tls_sock.getpeercert(binary_form=True)
             protocol_version = tls_sock.version()
             cipher = tls_sock.cipher()
             cipher_suite = cipher[0] if cipher else None
     certificate = x509.load_der_x509_certificate(der_cert)
-    return certificate, protocol_version, cipher_suite
+    return certificate, protocol_version, cipher_suite, connected_ip
 
 
-def _supports_deprecated_tls(host: str, port: int) -> bool:
+def _supports_deprecated_tls(host: str, port: int, pinned_ip: str) -> bool:
     """Best-effort check for TLS 1.0/1.1 support. Many OpenSSL builds
     disable these protocols entirely, in which case the handshake simply
     fails and we correctly report "not supported" rather than erroring.
+
+    Dials `pinned_ip` -- the address the certificate fetch already
+    reached -- never re-resolving `host`, so this second connection can't
+    be steered elsewhere by a changed DNS answer.
     """
     try:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -46,7 +75,7 @@ def _supports_deprecated_tls(host: str, port: int) -> bool:
         context.verify_mode = ssl.CERT_NONE
         context.minimum_version = ssl.TLSVersion.TLSv1
         context.maximum_version = ssl.TLSVersion.TLSv1_1
-        with socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT_SECONDS) as sock:
+        with socket.create_connection((pinned_ip, port), timeout=_CONNECT_TIMEOUT_SECONDS) as sock:
             with context.wrap_socket(sock, server_hostname=host):
                 return True
     except Exception:
@@ -67,8 +96,20 @@ class SSLModule(ScannerModule):
         if not host:
             return ScanModuleResult(module=self.name, error=f"Could not determine host from '{target}'")
 
+        # Every connection this module makes is gated here first: allowed
+        # port, blocked hostname literals, and EVERY resolved address
+        # checked against net_safety's private/loopback/link-local/
+        # reserved/multicast rules. Nothing is dialed for an unsafe target.
+        validation = net_safety.resolve_and_validate(host, port)
+        if isinstance(validation, net_safety.UnsafeTarget):
+            return ScanModuleResult(
+                module=self.name, error=f"Refusing to connect to {host}:{port}: {validation.reason}"
+            )
+
         try:
-            cert, protocol_version, cipher_suite = _fetch_certificate(host, port)
+            cert, protocol_version, cipher_suite, connected_ip = _fetch_certificate(
+                host, port, validation.resolved_ips
+            )
         except Exception as exc:
             return ScanModuleResult(
                 module=self.name, error=f"Could not retrieve certificate from {host}:{port}: {exc}"
@@ -138,7 +179,7 @@ class SSLModule(ScannerModule):
                 )
             )
 
-        if _supports_deprecated_tls(host, port):
+        if _supports_deprecated_tls(host, port, connected_ip):
             findings.append(
                 ScanFinding(
                     title="Deprecated TLS protocol accepted",
