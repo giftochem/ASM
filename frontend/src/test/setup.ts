@@ -10,6 +10,7 @@ afterEach(() => {
 afterAll(() => server.close());
 
 function clearAllCookies(): void {
+  if (typeof document === "undefined") return; // node-environment tests (e.g. the Vite proxy test) have no cookies
   document.cookie.split(";").forEach((entry) => {
     const name = entry.split("=")[0]?.trim();
     if (name) {

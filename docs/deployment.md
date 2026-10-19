@@ -18,7 +18,15 @@ integration — those are separate, not-yet-scoped work.
   if a new top-level router prefix is added to
   `backend/app/api/routes/__init__.py`, add it there too, or requests to
   it will silently fall through to the SPA and get `index.html` instead
-  of an API response.
+  of an API response. Some SPA pages share paths with the API (`/assets`,
+  `/assets/<id>`, `/alerts`, `/scans`, `/scans/<id>`, `/findings`,
+  `/reports`): a browser page load of one of those (GET/HEAD with an
+  `Accept` that includes `text/html`) gets the SPA; every other request
+  to those paths still reaches the API. The build puts its JS/CSS under
+  `/static/`, never `/assets/` (the API's prefix). After changing the
+  config, run `sh docker/nginx/test-routing.sh` — it checks the real
+  config in the real image against a stub API (needs Docker and the
+  certificates from step 2 below).
 - `nginx` sits on `asm_net` at a pinned address (`172.28.0.10`), which
   `app`'s `TRUSTED_PROXY_IPS_RAW` names deterministically (hardcoded in
   this file — see the comment on `app`'s `environment:` block).

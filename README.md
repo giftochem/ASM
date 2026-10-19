@@ -1484,6 +1484,18 @@ points" and "no permitted path", and a truncated result is never shown
 as a conclusion. The disclaimer "Observed exposure paths; exploitability
 not assessed." is always shown.
 
+**Routing reliability (Stage D.1)** — the SPA and the API share one
+origin, and both proxies route by path, so two things broke direct page
+loads: (1) the production build put its JS/CSS under `/assets/` — the
+API's prefix — so behind nginx the app couldn't start on any page; (2)
+pages whose paths the API also uses (`/assets`, `/assets/<id>`,
+`/alerts`, `/scans`, `/scans/<id>`, `/findings`, `/reports`) returned the
+API's JSON or 401 on a refresh, bookmark or new tab. The build now writes
+its bundles to `/static/`, and both nginx and the Vite dev proxy serve the
+SPA for a browser page load (GET/HEAD, `Accept` includes `text/html`) of
+exactly those page shapes, with `Vary: Accept`; every API call, every
+write and every other API path is routed exactly as before.
+
 ### SSRF hardening
 
 `app/scanners/net_safety.py` resolves a target hostname (all A/AAAA
@@ -1798,6 +1810,17 @@ curl "http://localhost:8000/audit-logs?action=scan.execute&limit=50" -b cookies.
 ```
 
 ### Running tests
+
+Production routing (Stage D.1) — the real `docker/nginx/nginx.conf` in
+the production nginx image, against a stub API, on a throwaway Docker
+network (needs the placeholder TLS certificates from docs/deployment.md):
+```bash
+sh docker/nginx/test-routing.sh
+```
+The frontend suite covers the same rule for the Vite dev proxy
+(`src/lib/viteDevProxy.test.ts` boots the real dev server) and checks that
+nginx's rules, the app's routes and the dev proxy agree
+(`src/lib/spaPageLoads.test.ts`).
 
 Backend:
 ```bash
