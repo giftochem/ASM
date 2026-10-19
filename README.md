@@ -1438,6 +1438,38 @@ modules, no API route, no UI, no migration, no network access.
   always rejected. Shared IPs, certificates, ASNs and name servers are
   never treated as paths.
 
+**Exposure Path Engine (Stage B)** — `GET /assets/exposure-paths`:
+observed exposure paths, **not verified exploit chains** ("Observed
+exposure paths; exploitability not assessed."). Read-only for every
+role; no write, no discovery, no scan, no network access.
+
+- A path runs from an asset with current exposure evidence at the
+  assessment time (`as_of`, default now) to an asset explicitly marked
+  `high` or `critical`, through relationships the traversal rules allow
+  forward. A `resolves_to` step also needs DNS evidence no older than 7
+  days at `as_of`. A target that is itself exposed is a zero-hop path.
+  DNS-only paths are labeled "observed infrastructure association";
+  analyst-entered steps are labeled as assertions.
+- Searches backward from at most `max_targets` (25) targets, one batched
+  query level per hop, up to `max_hops` (3), admitting at most
+  `max_nodes` (500) assets and returning at most `max_paths` (100) paths;
+  internal budgets also cap evaluated relationships (2,000) and partial
+  paths (10,000). Each limit stops the search cleanly and is reported in
+  `truncation_reasons`; ordering is total (criticality, hops, target,
+  path), so results are deterministic. Out-of-range limits and a naive
+  or future `as_of` are 400; malformed values are 422.
+- Evidence retrieval is bounded too: per evidence slot the database
+  returns only the latest confirmation, the earliest one and the latest
+  negative (`DISTINCT ON`/`GROUP BY`), plus inconclusive attempts inside
+  the freshness window (newest 25 per asset) -- never whole histories --
+  within one 20,000-row budget per assessment, qualification-critical
+  rows first. A budget cut is reported as an `evidence_budget`
+  truncation, and anything that couldn't be fully checked is never
+  treated as current.
+- No severity, score or probability is reported. Lifecycle status,
+  criticality and relationships are current stored state even for a
+  past `as_of`; only evidence is evaluated point-in-time.
+
 ### SSRF hardening
 
 `app/scanners/net_safety.py` resolves a target hostname (all A/AAAA

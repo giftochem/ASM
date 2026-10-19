@@ -34,12 +34,19 @@ a relationship that is stale/disappeared, an endpoint asset that is
 disappeared or deactivated, and any relationship whose endpoints aren't
 both in the requesting organization. Confidence is never consulted, and
 nothing here says anything about exploitability.
+
+Given an assessment time (`as_of`), evidence is point-in-time -- audit
+records and DNS results written later are ignored -- and with a
+`dns_freshness_window` a resolves_to is followed only when its DNS
+evidence is no older than the window (rule `dns_evidence_stale`
+otherwise). The path engine (attack_path_service) always passes both;
+lifecycle status itself is current stored state, not reconstructed.
 """
 
 import enum
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -153,13 +160,27 @@ def evaluate_traversal(
     target_asset: Asset | None,
     audit_entry: AuditLog | None = None,
     dns_evidence: DnsResolutionEvidence | None = None,
+    as_of: datetime | None = None,
+    dns_freshness_window: timedelta | None = None,
 ) -> TraversalDecision:
     """Pure decision for one relationship, walked from `from_asset_id`.
     `source_asset`/`target_asset` are the relationship's endpoints as
     loaded (None if missing); `audit_entry` is its creation audit record
     and `dns_evidence` the dns discovery result recording exactly this
     resolution, if any (evaluate_asset_relationships loads both,
-    organization-scoped)."""
+    organization-scoped).
+
+    With `as_of`, evaluation is point-in-time for evidence: an audit
+    record or DNS result written after `as_of` is ignored. With
+    `dns_freshness_window` too, a resolves_to is only followed when its
+    DNS evidence is no older than the window at `as_of` -- an old
+    observation is not treated as current just because the relationship
+    row is still active. Without them, behavior is unchanged."""
+    if as_of is not None:
+        if audit_entry is not None and audit_entry.created_at > as_of:
+            audit_entry = None
+        if dns_evidence is not None and dns_evidence.observed_at > as_of:
+            dns_evidence = None
     provenance = RelationshipProvenance(
         source=relationship.source.value,
         entered_by_user_id=audit_entry.user_id if audit_entry is not None else None,
@@ -236,6 +257,14 @@ def evaluate_traversal(
                 f"no completed {DNS_PROVIDER} discovery run in this organization recorded {source_asset.value} "
                 f"resolving to {target_asset.value}",
             )
+        if as_of is not None and dns_freshness_window is not None and as_of - dns_evidence.observed_at > dns_freshness_window:
+            return decide(
+                False,
+                "dns_evidence_stale",
+                f"the latest {DNS_PROVIDER} discovery result recording {source_asset.value} resolving to "
+                f"{target_asset.value} is from {dns_evidence.observed_at.isoformat()}, more than {dns_freshness_window} "
+                f"before the assessment time",
+            )
         record = f"{dns_evidence.record_type} record" if dns_evidence.record_type else "record"
         return decide(
             True,
@@ -261,17 +290,26 @@ def evaluate_traversal(
     return decide(
         True,
         "analyst_entered_forward",
-        f"{meaning}: {source_asset.value} -> {target_asset.value}, entered by user {audit_entry.user_id} "
-        f"at {audit_entry.created_at.isoformat()} (followed forward only)",
+        # Who entered it stays in the (admin-only) audit record and in
+        # `provenance` for internal callers -- never in this
+        # user-facing explanation.
+        f"{meaning}: {source_asset.value} -> {target_asset.value}, entered by an analyst at "
+        f"{audit_entry.created_at.isoformat()} (audit record {audit_entry.id}; followed forward only)",
     )
 
 
 def evaluate_asset_relationships(
-    db: Session, organization_id: uuid.UUID, asset_id: uuid.UUID
+    db: Session,
+    organization_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    *,
+    as_of: datetime | None = None,
+    dns_freshness_window: timedelta | None = None,
 ) -> list[TraversalDecision]:
     """A decision for every relationship touching `asset_id` (outgoing as
     forward, incoming as reverse), walked from that asset. Empty when the
-    asset isn't in this organization. A fixed number of queries."""
+    asset isn't in this organization. A fixed number of queries.
+    `as_of`/`dns_freshness_window`: see evaluate_traversal."""
     from_asset = db.query(Asset).filter(Asset.id == asset_id, Asset.organization_id == organization_id).one_or_none()
     if from_asset is None:
         return []
@@ -280,64 +318,114 @@ def evaluate_asset_relationships(
         .filter(or_(AssetRelationship.source_asset_id == asset_id, AssetRelationship.target_asset_id == asset_id))
         .all()
     )
-    if not relationships:
-        return []
+    decisions = _evaluate_pairs(
+        db,
+        organization_id,
+        [(relationship, asset_id) for relationship in relationships],
+        as_of=as_of,
+        dns_freshness_window=dns_freshness_window,
+    )
+    return sorted(decisions, key=lambda d: (d.direction, d.relationship_type, str(d.relationship_id)))
 
+
+def evaluate_forward_traversals(
+    db: Session,
+    organization_id: uuid.UUID,
+    relationships: list[AssetRelationship],
+    *,
+    as_of: datetime | None = None,
+    dns_freshness_window: timedelta | None = None,
+) -> list[TraversalDecision]:
+    """Each relationship evaluated from its own source -- the forward
+    decision a path search needs for every relationship it considers at
+    one level. The same rules as evaluate_asset_relationships, batched:
+    a fixed number of queries however many relationships are passed.
+    Decisions come back in input order."""
+    return _evaluate_pairs(
+        db,
+        organization_id,
+        [(relationship, relationship.source_asset_id) for relationship in relationships],
+        as_of=as_of,
+        dns_freshness_window=dns_freshness_window,
+    )
+
+
+def _evaluate_pairs(
+    db: Session,
+    organization_id: uuid.UUID,
+    pairs: list[tuple[AssetRelationship, uuid.UUID]],
+    *,
+    as_of: datetime | None,
+    dns_freshness_window: timedelta | None,
+) -> list[TraversalDecision]:
+    if not pairs:
+        return []
+    relationships = list({relationship.id: relationship for relationship, _ in pairs}.values())
     endpoint_ids = {r.source_asset_id for r in relationships} | {r.target_asset_id for r in relationships}
     # Loaded unscoped so a cross-organization endpoint is seen -- and
     # rejected -- rather than silently looking like a missing one.
-    assets = {asset.id: asset for asset in db.query(Asset).filter(Asset.id.in_(list(endpoint_ids)))}
-    audit_entries = _creation_audit_entries(db, organization_id, [r.id for r in relationships])
-    dns_evidence = _dns_resolution_evidence(db, organization_id, relationships)
-
-    decisions = [
+    assets = {asset.id: asset for asset in db.query(Asset).filter(Asset.id.in_(sorted(endpoint_ids, key=str)))}
+    audit_entries = _creation_audit_entries(db, organization_id, [r.id for r in relationships], as_of)
+    dns_evidence = _dns_resolution_evidence(db, organization_id, relationships, as_of)
+    return [
         evaluate_traversal(
             relationship,
-            from_asset_id=asset_id,
+            from_asset_id=from_asset_id,
             organization_id=organization_id,
             source_asset=assets.get(relationship.source_asset_id),
             target_asset=assets.get(relationship.target_asset_id),
             audit_entry=audit_entries.get(relationship.id),
             dns_evidence=dns_evidence.get(relationship.id),
+            as_of=as_of,
+            dns_freshness_window=dns_freshness_window,
         )
-        for relationship in relationships
+        for relationship, from_asset_id in pairs
     ]
-    return sorted(decisions, key=lambda d: (d.direction, d.relationship_type, str(d.relationship_id)))
 
 
-def _creation_audit_entries(db: Session, organization_id: uuid.UUID, relationship_ids: list) -> dict[uuid.UUID, AuditLog]:
+def _creation_audit_entries(
+    db: Session, organization_id: uuid.UUID, relationship_ids: list, as_of: datetime | None = None
+) -> dict[uuid.UUID, AuditLog]:
     """The earliest creation record per relationship, in this
     organization only (a re-POST of an existing relationship is logged
-    again; the first entry is who originally entered it)."""
+    again; the first entry is who originally entered it), written no
+    later than `as_of` when given."""
     entries: dict[uuid.UUID, AuditLog] = {}
-    rows = (
-        db.query(AuditLog)
-        .filter(
-            AuditLog.action == RELATIONSHIP_CREATE_AUDIT_ACTION,
-            AuditLog.organization_id == organization_id,
-            AuditLog.resource_id.in_(relationship_ids),
-        )
-        .order_by(AuditLog.created_at, AuditLog.id)
-        .all()
+    query = db.query(AuditLog).filter(
+        AuditLog.action == RELATIONSHIP_CREATE_AUDIT_ACTION,
+        AuditLog.organization_id == organization_id,
+        AuditLog.resource_id.in_(sorted(relationship_ids, key=str)),
     )
-    for row in rows:
+    if as_of is not None:
+        query = query.filter(AuditLog.created_at <= as_of)
+    # One row per relationship, collapsed in the database: repeated
+    # re-POSTs of the same relationship never load their whole history.
+    for row in (
+        query.distinct(AuditLog.resource_id).order_by(AuditLog.resource_id, AuditLog.created_at, AuditLog.id).all()
+    ):
         entries.setdefault(row.resource_id, row)
     return entries
 
 
 def _dns_resolution_evidence(
-    db: Session, organization_id: uuid.UUID, relationships: list[AssetRelationship]
+    db: Session, organization_id: uuid.UUID, relationships: list[AssetRelationship], as_of: datetime | None = None
 ) -> dict[uuid.UUID, DnsResolutionEvidence]:
     """Per resolves_to relationship, the latest stored dns discovery
-    result recording exactly its direction: a completed `dns` run in
-    this organization whose seed is the relationship's source, with an
-    accepted resolves_to result whose asset is its target. Evidence for
-    the reverse direction, from another provider, from an unfinished or
-    failed run, or recorded under another organization never matches."""
+    result (no later than `as_of`, when given) recording exactly its
+    direction: a completed `dns` run in this organization whose seed is
+    the relationship's source, with an accepted resolves_to result whose
+    asset is its target. Evidence for the reverse direction, from
+    another provider, from an unfinished or failed run, or recorded
+    under another organization never matches.
+
+    DISTINCT ON keeps only the newest row per (seed, target) pair in the
+    database itself, so this never loads a pair's full history. Ties go
+    to the higher id -- for UUIDs Postgres' byte order and Python's
+    string order agree."""
     dns_relationships = [r for r in relationships if r.relationship_type is RelationshipType.resolves_to]
     if not dns_relationships:
         return {}
-    rows = (
+    query = (
         db.query(DiscoveryResult, DiscoveryRun)
         .join(DiscoveryRun, DiscoveryRun.id == DiscoveryResult.discovery_run_id)
         .filter(
@@ -349,14 +437,20 @@ def _dns_resolution_evidence(
             DiscoveryResult.resulting_asset_id.in_(sorted({r.target_asset_id for r in dns_relationships}, key=str)),
             DiscoveryResult.outcome.in_(_DNS_ACCEPTED_OUTCOMES),
         )
+    )
+    if as_of is not None:
+        query = query.filter(DiscoveryResult.created_at <= as_of)
+    rows = (
+        query.distinct(DiscoveryRun.seed_asset_id, DiscoveryResult.resulting_asset_id)
+        .order_by(
+            DiscoveryRun.seed_asset_id,
+            DiscoveryResult.resulting_asset_id,
+            DiscoveryResult.created_at.desc(),
+            DiscoveryResult.id.desc(),
+        )
         .all()
     )
-    latest: dict[tuple, tuple[DiscoveryResult, DiscoveryRun]] = {}
-    for result, run in rows:
-        key = (run.seed_asset_id, result.resulting_asset_id)
-        held = latest.get(key)
-        if held is None or (result.created_at, str(result.id)) > (held[0].created_at, str(held[0].id)):
-            latest[key] = (result, run)
+    latest = {(run.seed_asset_id, result.resulting_asset_id): (result, run) for result, run in rows}
 
     evidence: dict[uuid.UUID, DnsResolutionEvidence] = {}
     for relationship in dns_relationships:

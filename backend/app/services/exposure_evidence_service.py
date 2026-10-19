@@ -62,6 +62,19 @@ Only `current` evidence qualifies as an observed entry point. Evaluation
 is point-in-time: records after `as_of` are ignored, and every choice
 between records uses a total ordering, so the same data and `as_of`
 always give the same answer whatever order rows come back in.
+
+Bounded retrieval: attempt history is never loaded wholesale. Per slot,
+the database returns one row each for the latest confirmation, the
+earliest confirmation and the latest negative (DISTINCT ON / GROUP BY)
+-- everything qualification depends on -- plus inconclusive attempts
+inside the freshness window only, newest first, at most
+INCONCLUSIVE_PER_ASSET per asset. All of it draws on one per-assessment
+EVIDENCE_ROW_BUDGET, qualification-critical queries first. A cut is
+always detected (one row past the budget is fetched) and handled
+conservatively: evidence that couldn't be fully checked is never treated
+as current, and the asset is flagged `evidence_truncated`. Inconclusive
+attempts are counted within the window, so for evidence last confirmed
+before it the count covers the window only (said on the evidence).
 """
 
 import enum
@@ -70,6 +83,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import String, and_, case, cast, exists, func, literal, null, or_, select, tuple_, union_all
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Session
 
 from app.core.enums import ChangeType, DiscoveryResultOutcome, DiscoveryRunStatus, LifecycleStatus, ScanStatus
@@ -169,6 +184,10 @@ class AssetExposure:
     is_observed_entry_point: bool
     evidence: tuple[ExposureEvidence, ...]
     limitations: tuple[str, ...]
+    # True when the evidence budget cut something qualification depends
+    # on for this asset: it may be missing evidence, and anything that
+    # couldn't be fully checked was not treated as current.
+    evidence_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -230,25 +249,34 @@ def assess_exposure(
     if not assets:
         return {}
 
-    ids = list(assets)
-    observations = _observations_by_asset(db, ids, as_of)
-    slots: list[_Slot] = []
-    slots += _discovery_slots(db, organization_id, ids, as_of, observations)
-    slots += _scan_slots(db, ids, as_of)
+    ids = sorted(assets, key=str)
+    window_start = as_of - freshness_window
+    budget = _Budget(EVIDENCE_ROW_BUDGET)
+    loaded = _load_slots(db, organization_id, ids, as_of, window_start, budget)
+    observations, observations_cut = _observations_by_asset(db, ids, as_of, budget)
+    _attach_observations(loaded.slots, observations)
 
     evidence: dict[uuid.UUID, list[ExposureEvidence]] = defaultdict(list)
-    for slot in slots:
+    for slot in loaded.slots.values():
         # Only something that was actually confirmed becomes evidence --
-        # failures alone never produce an item.
-        if any(attempt.result is AttemptResult.confirmed for attempt in slot.attempts):
-            evidence[slot.asset_id].append(_slot_evidence(slot, as_of, freshness_window))
+        # failures alone never produce an item. (Every loaded slot has a
+        # confirmation: slots come from the latest-confirmation query.)
+        item = _slot_evidence(slot, as_of, freshness_window)
+        evidence[slot.asset_id].append(_apply_retrieval_limits(item, slot, loaded, window_start))
     _add_unattributed_http(evidence, observations, as_of, freshness_window)
-    _add_certificate_records(db, ids, evidence)
+    certificates_cut = _add_certificate_records(db, ids, evidence, budget)
     _add_context_evidence(evidence, observations, as_of, freshness_window)
 
+    notes = defaultdict(list)
+    for asset_id in _affected(ids, observations_cut):
+        notes[asset_id].append("the evidence budget was reached before every observation was loaded")
+    for asset_id in _affected(ids, certificates_cut):
+        notes[asset_id].append("the evidence budget was reached before every certificate record was loaded")
     return {
-        asset_id: _assess_asset(asset, evidence.get(asset_id, []))
-        for asset_id, asset in sorted(assets.items(), key=lambda item: str(item[0]))
+        asset_id: _assess_asset(
+            assets[asset_id], evidence.get(asset_id, []), asset_id in loaded.truncated_assets, notes.get(asset_id, [])
+        )
+        for asset_id in ids
     }
 
 
@@ -266,11 +294,324 @@ def assess_asset_exposure(
     ).get(asset_id)
 
 
-# --- collection ---------------------------------------------------------------------
+# --- bounded retrieval ----------------------------------------------------------------
+
+# Rows loaded into Python per assessment, across every evidence query.
+# Qualification-critical queries (latest confirmations, latest negatives)
+# draw on it first.
+EVIDENCE_ROW_BUDGET = 20_000
+# Newest inconclusive attempts in the freshness window examined per asset
+# (they only feed counts -- they never change qualification).
+INCONCLUSIVE_PER_ASSET = 25
+
+_SOURCE_HTTP = f"discovery:{HTTP_PROVIDER}"
+_SOURCE_TLS = f"discovery:{CERTIFICATE_PROVIDER}"
+_SOURCE_PORTS = f"scan:{PORT_SCANNER_MODULE}"
+_SOURCE_SSL = f"scan:{SSL_MODULE}"
+_SOURCE_TYPES = {
+    _SOURCE_HTTP: EvidenceType.http_response,
+    _SOURCE_TLS: EvidenceType.tls_handshake,
+    _SOURCE_PORTS: EvidenceType.open_port,
+    _SOURCE_SSL: EvidenceType.tls_handshake,
+}
+_NOTES = {
+    "http_failed": f"the HTTP attempt failed; {_FREE_TEXT_FAILURE}",
+    "http_rejected": "the response redirected outside the authorized scope, so it wasn't recorded as evidence",
+    "http_no_status": "the result recorded no status code",
+    f"run_failed_{HTTP_PROVIDER}": f"the {HTTP_PROVIDER} discovery run failed; {_FREE_TEXT_FAILURE}",
+    f"run_failed_{CERTIFICATE_PROVIDER}": f"the {CERTIFICATE_PROVIDER} discovery run failed; {_FREE_TEXT_FAILURE}",
+    "port_closed": "the port was closed (the connection was refused)",
+    "port_filtered": "the port was filtered (the probe timed out or the host was unreachable)",
+    f"module_empty_{PORT_SCANNER_MODULE}": f"the {PORT_SCANNER_MODULE} scan module stored no result; {_FREE_TEXT_FAILURE}",
+    f"module_empty_{SSL_MODULE}": f"the {SSL_MODULE} scan module stored no result; {_FREE_TEXT_FAILURE}",
+}
+_UUID = PGUUID(as_uuid=True)
 
 
-def _observations_by_asset(db: Session, ids: list, as_of: datetime) -> dict[uuid.UUID, list[Observation]]:
-    rows = (
+class _Budget:
+    """Rows still allowed this assessment. Each query fetches one row past
+    what's left, so a cut is always detected, never silent. Statements
+    must be ordered by asset id first: then a cut leaves every asset
+    before the first dropped row complete."""
+
+    def __init__(self, rows: int):
+        self.remaining = rows
+
+    def _keep(self, rows: list, asset_of) -> tuple[list, uuid.UUID | None]:
+        if len(rows) <= self.remaining:
+            self.remaining -= len(rows)
+            return rows, None
+        cut_at = asset_of(rows[self.remaining])
+        kept = rows[: self.remaining]
+        self.remaining = 0
+        return kept, cut_at
+
+    def rows(self, db: Session, statement) -> tuple[list, uuid.UUID | None]:
+        return self._keep(db.execute(statement.limit(self.remaining + 1)).all(), lambda row: row.asset_id)
+
+    def entities(self, db: Session, query) -> tuple[list, uuid.UUID | None]:
+        return self._keep(query.limit(self.remaining + 1).all(), lambda entity: entity.asset_id)
+
+
+def _affected(ids: list, cut_at: uuid.UUID | None) -> set[uuid.UUID]:
+    """Assets a cut may have touched: the one whose row was dropped and
+    every asset after it (UUID order, as Postgres sorts them)."""
+    return {asset_id for asset_id in ids if cut_at is not None and asset_id >= cut_at}
+
+
+def _attempt_rows(organization_id, ids: list, as_of: datetime):
+    """Every evidence attempt for these assets up to `as_of`, as one
+    UNION ALL of uniform rows: (asset_id, source, subject, kind, note, ts,
+    result_id, discovery_run_id, scan_id). `subject` is NULL for
+    asset-level attempts -- a whole failed run, or a scan module that
+    stored nothing -- which apply to every slot of that source. Nothing
+    here is executed on its own; callers filter, collapse and bound it."""
+    run, result, scan = DiscoveryRun, DiscoveryResult, Scan
+    no_uuid, no_text = cast(null(), _UUID), cast(null(), String)
+    untimed_or_by = lambda column: or_(column <= as_of, column.is_(None))  # noqa: E731
+
+    scheme = result.evidence["scheme"].astext
+    status_code = result.evidence["status_code"]
+    responded = and_(
+        result.outcome.in_(sorted(_HTTP_CONFIRMING_OUTCOMES, key=str)),
+        func.jsonb_typeof(status_code) == "number",
+        status_code.astext.op("~")("^[0-9]+$"),
+    )
+    http = (
+        select(
+            run.seed_asset_id.label("asset_id"),
+            literal(_SOURCE_HTTP, String).label("source"),
+            scheme.label("subject"),
+            case((responded, "confirmed"), else_="inconclusive").label("kind"),
+            case(
+                (responded, ""),
+                (result.outcome == DiscoveryResultOutcome.rejected, "http_rejected"),
+                (result.outcome == DiscoveryResultOutcome.failed, "http_failed"),
+                else_="http_no_status",
+            ).label("note"),
+            result.created_at.label("ts"),
+            result.id.label("result_id"),
+            run.id.label("discovery_run_id"),
+            no_uuid.label("scan_id"),
+        )
+        .select_from(result)
+        .join(run, run.id == result.discovery_run_id)
+        .where(
+            run.organization_id == organization_id,
+            run.seed_asset_id.in_(ids),
+            run.provider_name == HTTP_PROVIDER,
+            run.status == DiscoveryRunStatus.completed,
+            result.resulting_asset_id == run.seed_asset_id,
+            scheme.in_(("http", "https")),
+            result.created_at <= as_of,
+        )
+    )
+    tls = (
+        select(
+            run.seed_asset_id, literal(_SOURCE_TLS, String), result.candidate_value, literal("confirmed", String),
+            literal("", String), result.created_at, result.id, run.id, no_uuid,
+        )
+        .select_from(result)
+        .join(run, run.id == result.discovery_run_id)
+        .where(
+            run.organization_id == organization_id,
+            run.seed_asset_id.in_(ids),
+            run.provider_name == CERTIFICATE_PROVIDER,
+            run.status == DiscoveryRunStatus.completed,
+            result.resulting_asset_id == run.seed_asset_id,
+            result.outcome.in_(sorted(_TLS_CONFIRMING_OUTCOMES, key=str)),
+            result.created_at <= as_of,
+        )
+    )
+    failed_runs = select(
+        run.seed_asset_id, func.concat("discovery:", run.provider_name), no_text, literal("inconclusive", String),
+        func.concat("run_failed_", run.provider_name), run.completed_at, no_uuid, run.id, no_uuid,
+    ).where(
+        run.organization_id == organization_id,
+        run.seed_asset_id.in_(ids),
+        run.provider_name.in_(sorted(EVIDENCE_PROVIDERS)),
+        run.status == DiscoveryRunStatus.failed,
+        untimed_or_by(run.completed_at),
+    )
+    # A completed scan has already passed the scan executor's
+    # authorization re-check; queued/running/failed/cancelled scans prove
+    # nothing.
+    completed_scan = and_(scan.asset_id.in_(ids), scan.status == ScanStatus.completed, untimed_or_by(scan.completed_at))
+    port = PortScanResult
+    ports = (
+        select(
+            scan.asset_id, literal(_SOURCE_PORTS, String), func.concat(port.port, "/", port.protocol),
+            case((port.state == "open", "confirmed"), (port.state == "closed", "negative"), else_="inconclusive"),
+            case(
+                (port.state == "open", ""),
+                (port.state == "closed", "port_closed"),
+                (port.state == "filtered", "port_filtered"),
+                else_=func.concat("port_other:", port.state),
+            ),
+            scan.completed_at, port.id, no_uuid, scan.id,
+        )
+        .select_from(port)
+        .join(scan, scan.id == port.scan_id)
+        .where(completed_scan, port.asset_id == scan.asset_id)
+    )
+    ssl = (
+        select(
+            scan.asset_id, literal(_SOURCE_SSL, String), func.concat(SSLInfo.hostname, ":", SSLInfo.port),
+            literal("confirmed", String), literal("", String), scan.completed_at, SSLInfo.id, no_uuid, scan.id,
+        )
+        .select_from(SSLInfo)
+        .join(scan, scan.id == SSLInfo.scan_id)
+        .where(completed_scan, SSLInfo.asset_id == scan.asset_id)
+    )
+
+    def module_stored_nothing(module: str, rows_model, source: str):
+        # A completed scan that ran a module but stored nothing for it:
+        # the module couldn't complete (blocked target, DNS failure,
+        # failed handshake), recorded only as a free-text Finding.
+        stored = exists().where(rows_model.scan_id == scan.id, rows_model.asset_id == scan.asset_id)
+        return select(
+            scan.asset_id, literal(source, String), no_text, literal("inconclusive", String),
+            literal(f"module_empty_{module}", String), scan.completed_at, no_uuid, no_uuid, scan.id,
+        ).where(completed_scan, scan.modules_requested.any(module), ~stored)
+
+    return union_all(
+        http, tls, failed_runs, ports, ssl,
+        module_stored_nothing(PORT_SCANNER_MODULE, PortScanResult, _SOURCE_PORTS),
+        module_stored_nothing(SSL_MODULE, SSLInfo, _SOURCE_SSL),
+    ).subquery("evidence_attempts")
+
+
+def _newest_first(columns):
+    """SQL counterpart of _order_key, descending: time (untimed last),
+    then ids -- the same choice _classify makes among equal-rank rows."""
+    return (
+        columns.ts.desc().nulls_last(),
+        columns.result_id.desc().nulls_last(),
+        columns.discovery_run_id.desc().nulls_last(),
+        columns.scan_id.desc().nulls_last(),
+    )
+
+
+@dataclass
+class _LoadedSlots:
+    slots: dict[tuple, _Slot]
+    truncated_assets: set[uuid.UUID]  # something qualification depends on was cut
+    unverified_negatives: set[uuid.UUID]  # port slots whose later results weren't all checked
+    first_unknown: set[uuid.UUID]
+    inconclusive_capped: set[uuid.UUID]  # more inconclusive attempts in the window than were examined
+    inconclusive_unloaded: set[uuid.UUID]  # window attempts not examined at all (budget)
+
+
+def _attempt(row) -> _Attempt:
+    note = row.note or ""
+    if note.startswith("port_other:"):
+        text = f"unrecognized port state '{note.removeprefix('port_other:')}'"
+    else:
+        text = _NOTES.get(note, "")
+    return _Attempt(
+        at=row.ts,
+        result=AttemptResult(row.kind),
+        note=text,
+        result_id=row.result_id,
+        discovery_run_id=row.discovery_run_id,
+        scan_id=row.scan_id,
+    )
+
+
+def _load_slots(db: Session, organization_id, ids: list, as_of: datetime, window_start: datetime, budget: _Budget) -> _LoadedSlots:
+    attempts = _attempt_rows(organization_id, ids, as_of)
+    c = attempts.c
+    key = (c.asset_id, c.source, c.subject)
+
+    # 1. Latest confirmation per slot (qualification-critical). Slots
+    #    exist only where something was confirmed.
+    latest, latest_cut = budget.rows(
+        db, select(attempts).where(c.kind == "confirmed").distinct(*key).order_by(*key, *_newest_first(c))
+    )
+    slots: dict[tuple, _Slot] = {}
+    for row in latest:
+        slot = _Slot(asset_id=row.asset_id, evidence_type=_SOURCE_TYPES[row.source], source=row.source, subject=row.subject)
+        slot.attempts.append(_attempt(row))
+        slots[(row.asset_id, row.source, row.subject)] = slot
+    truncated = _affected(ids, latest_cut)
+
+    # 2. Latest negative per confirmed port slot (qualification-critical:
+    #    a negative at or after the confirmation supersedes it).
+    unverified: set[uuid.UUID] = set()
+    port_slots = sorted({(asset_id, subject) for asset_id, source, subject in slots if source == _SOURCE_PORTS}, key=str)
+    if port_slots:
+        negatives, negatives_cut = budget.rows(
+            db,
+            select(attempts)
+            .where(c.kind == "negative", c.source == _SOURCE_PORTS, tuple_(c.asset_id, c.subject).in_(port_slots))
+            .distinct(*key)
+            .order_by(*key, *_newest_first(c)),
+        )
+        for row in negatives:
+            slots[(row.asset_id, row.source, row.subject)].attempts.append(_attempt(row))
+        unverified = _affected(ids, negatives_cut)
+        truncated |= unverified
+
+    # 3. Earliest timed confirmation per slot (reporting only).
+    earliest, earliest_cut = budget.rows(
+        db,
+        select(c.asset_id, c.source, c.subject, func.min(c.ts).label("ts"))
+        .where(c.kind == "confirmed", c.ts.isnot(None))
+        .group_by(*key)
+        .order_by(*key),
+    )
+    for row in earliest:
+        slot = slots.get((row.asset_id, row.source, row.subject))
+        if slot is not None:
+            slot.attempts.append(_Attempt(at=row.ts, result=AttemptResult.confirmed))
+
+    # 4. Inconclusive attempts inside the freshness window, newest first,
+    #    at most INCONCLUSIVE_PER_ASSET per asset (counts only).
+    capped: set[uuid.UUID] = set()
+    unloaded: set[uuid.UUID] = set()
+    slot_assets = sorted({asset_id for asset_id, _, _ in slots}, key=str)
+    if slot_assets:
+        numbered = (
+            select(attempts, func.row_number().over(partition_by=c.asset_id, order_by=_newest_first(c)).label("rn"))
+            .where(
+                c.kind == "inconclusive",
+                c.asset_id.in_(slot_assets),
+                or_(and_(c.ts >= window_start, c.ts <= as_of), c.ts.is_(None)),
+            )
+            .subquery("window_inconclusive")
+        )
+        inconclusive, inconclusive_cut = budget.rows(
+            db,
+            select(numbered).where(numbered.c.rn <= INCONCLUSIVE_PER_ASSET + 1).order_by(numbered.c.asset_id, numbered.c.rn),
+        )
+        for row in inconclusive:
+            if row.rn > INCONCLUSIVE_PER_ASSET:
+                capped.add(row.asset_id)  # the extra row only proves there are more
+                continue
+            if row.subject is None:  # asset-level: every slot of that source
+                targets = [s for (asset_id, source, _), s in slots.items() if asset_id == row.asset_id and source == row.source]
+            else:
+                targets = [slots[k] for k in [(row.asset_id, row.source, row.subject)] if k in slots]
+            for slot in targets:
+                slot.attempts.append(_attempt(row))
+        unloaded = _affected(slot_assets, inconclusive_cut)
+
+    return _LoadedSlots(
+        slots=slots,
+        truncated_assets=truncated,
+        unverified_negatives=unverified,
+        first_unknown=_affected(ids, earliest_cut),
+        inconclusive_capped=capped,
+        inconclusive_unloaded=unloaded,
+    )
+
+
+def _observations_by_asset(
+    db: Session, ids: list, as_of: datetime, budget: _Budget
+) -> tuple[dict[uuid.UUID, list[Observation]], uuid.UUID | None]:
+    """Only the latest observation per (asset, change type, field) -- all
+    any caller uses -- collapsed in the database."""
+    query = (
         db.query(Observation)
         .filter(
             Observation.asset_id.in_(ids),
@@ -286,12 +627,20 @@ def _observations_by_asset(db: Session, ids: list, as_of: datetime) -> dict[uuid
                 ]
             ),
         )
-        .all()
+        .distinct(Observation.asset_id, Observation.change_type, Observation.field_name)
+        .order_by(
+            Observation.asset_id,
+            Observation.change_type,
+            Observation.field_name,
+            Observation.observed_at.desc(),
+            Observation.id.desc(),
+        )
     )
+    rows, cut_at = budget.entities(db, query)
     by_asset: dict[uuid.UUID, list[Observation]] = defaultdict(list)
     for row in sorted(rows, key=lambda r: (r.observed_at, str(r.id)), reverse=True):
         by_asset[row.asset_id].append(row)  # newest first, ties by id
-    return by_asset
+    return by_asset, cut_at
 
 
 def _latest_observation(observations: list[Observation], change_types: tuple, field_name: str) -> Observation | None:
@@ -301,162 +650,38 @@ def _latest_observation(observations: list[Observation], change_types: tuple, fi
     return None
 
 
-def _http_attempt(result: DiscoveryResult, run: DiscoveryRun) -> _Attempt:
-    evidence = result.evidence or {}
-    common = {"at": result.created_at, "result_id": result.id, "discovery_run_id": run.id}
-    if result.outcome in _HTTP_CONFIRMING_OUTCOMES and isinstance(evidence.get("status_code"), int):
-        return _Attempt(result=AttemptResult.confirmed, **common)
-    if result.outcome is DiscoveryResultOutcome.rejected:
-        note = "the response redirected outside the authorized scope, so it wasn't recorded as evidence"
-    elif result.outcome is DiscoveryResultOutcome.failed:
-        note = f"the HTTP attempt failed; {_FREE_TEXT_FAILURE}"
-    else:
-        note = "the result recorded no status code"
-    return _Attempt(result=AttemptResult.inconclusive, note=note, **common)
-
-
-def _discovery_slots(db: Session, organization_id, ids: list, as_of: datetime, observations) -> list[_Slot]:
-    runs = {
-        run.id: run
-        for run in db.query(DiscoveryRun).filter(
-            DiscoveryRun.organization_id == organization_id,
-            DiscoveryRun.seed_asset_id.in_(ids),
-            DiscoveryRun.provider_name.in_(sorted(EVIDENCE_PROVIDERS)),
-            DiscoveryRun.status.in_([DiscoveryRunStatus.completed, DiscoveryRunStatus.failed]),
-        )
-    }
-    if not runs:
-        return []
-
-    slots: dict[tuple, _Slot] = {}
-    failed_runs: dict[tuple, list[_Attempt]] = defaultdict(list)  # (asset, provider) -> whole-run failures
-    for run in runs.values():
-        if run.status is DiscoveryRunStatus.failed and (run.completed_at is None or run.completed_at <= as_of):
-            failed_runs[(run.seed_asset_id, run.provider_name)].append(
-                _Attempt(
-                    at=run.completed_at,
-                    result=AttemptResult.inconclusive,
-                    note=f"the {run.provider_name} discovery run failed; {_FREE_TEXT_FAILURE}",
-                    discovery_run_id=run.id,
-                )
-            )
-
-    results = (
-        db.query(DiscoveryResult)
-        .filter(DiscoveryResult.discovery_run_id.in_(list(runs)), DiscoveryResult.created_at <= as_of)
-        .all()
-    )
-    for result in results:
-        run = runs[result.discovery_run_id]
-        # A result about anything but the run's own seed isn't this
-        # evidence (http/certificate results always name the seed).
-        if run.status is not DiscoveryRunStatus.completed or result.resulting_asset_id != run.seed_asset_id:
-            continue
-        if run.provider_name == HTTP_PROVIDER:
-            scheme = (result.evidence or {}).get("scheme")
-            if scheme not in ("http", "https"):
-                continue
-            key = (run.seed_asset_id, EvidenceType.http_response, scheme)
-            source = f"discovery:{HTTP_PROVIDER}"
-            attempt = _http_attempt(result, run)
-        elif run.provider_name == CERTIFICATE_PROVIDER:
-            if result.outcome not in _TLS_CONFIRMING_OUTCOMES:
-                continue
-            key = (run.seed_asset_id, EvidenceType.tls_handshake, result.candidate_value)
-            source = f"discovery:{CERTIFICATE_PROVIDER}"
-            attempt = _Attempt(
-                at=result.created_at, result=AttemptResult.confirmed, result_id=result.id, discovery_run_id=run.id
-            )
+def _attach_observations(slots: dict[tuple, _Slot], observations) -> None:
+    for (asset_id, source, subject), slot in slots.items():
+        if source == _SOURCE_HTTP:
+            change_types, field_name = (ChangeType.http_observed, ChangeType.http_changed), f"http:{subject}"
+        elif source == _SOURCE_TLS:
+            change_types, field_name = (ChangeType.certificate_observed, ChangeType.certificate_changed), subject
         else:
             continue
-        slot = slots.setdefault(key, _Slot(asset_id=key[0], evidence_type=key[1], source=source, subject=key[2]))
-        slot.attempts.append(attempt)
-
-    for (asset_id, evidence_type, subject), slot in slots.items():
-        provider = HTTP_PROVIDER if evidence_type is EvidenceType.http_response else CERTIFICATE_PROVIDER
-        slot.attempts.extend(failed_runs.get((asset_id, provider), []))
-        if evidence_type is EvidenceType.http_response:
-            observation = _latest_observation(
-                observations.get(asset_id, []), (ChangeType.http_observed, ChangeType.http_changed), f"http:{subject}"
-            )
-        else:
-            observation = _latest_observation(
-                observations.get(asset_id, []), (ChangeType.certificate_observed, ChangeType.certificate_changed), subject
-            )
+        observation = _latest_observation(observations.get(asset_id, []), change_types, field_name)
         slot.observation_id = observation.id if observation is not None else None
-    return list(slots.values())
 
 
-def _port_attempt(row: PortScanResult, scan: Scan) -> _Attempt:
-    common = {"at": scan.completed_at, "result_id": row.id, "scan_id": scan.id}
-    if row.state == "open":
-        return _Attempt(result=AttemptResult.confirmed, **common)
-    if row.state == "closed":
-        return _Attempt(result=AttemptResult.negative, note="the port was closed (the connection was refused)", **common)
-    if row.state == "filtered":
-        return _Attempt(
-            result=AttemptResult.inconclusive, note="the port was filtered (the probe timed out or the host was unreachable)", **common
+def _apply_retrieval_limits(item: ExposureEvidence, slot: _Slot, loaded: _LoadedSlots, window_start: datetime) -> ExposureEvidence:
+    """Says what bounded retrieval left out of this item, and never lets
+    an item that couldn't be fully checked count as current."""
+    limitations = list(item.limitations)
+    if slot.source == _SOURCE_PORTS and slot.asset_id in loaded.unverified_negatives:
+        limitations.insert(0, "the evidence budget was reached before this port's later results were checked, so it isn't treated as current")
+        item = replace(item, freshness=Freshness.unknown, qualifies=False, contradicted_at=None)
+    if slot.asset_id in loaded.first_unknown:
+        limitations.append("the earliest confirmation wasn't determined (evidence budget reached)")
+        item = replace(item, first_confirmed_at=None)
+    if slot.asset_id in loaded.inconclusive_unloaded:
+        limitations.append("inconclusive attempts weren't examined (evidence budget reached)")
+    elif slot.asset_id in loaded.inconclusive_capped:
+        limitations.append(
+            f"only the newest {INCONCLUSIVE_PER_ASSET} inconclusive attempts in the freshness window were examined; "
+            f"the count is a lower bound"
         )
-    return _Attempt(result=AttemptResult.inconclusive, note=f"unrecognized port state '{row.state}'", **common)
-
-
-def _scan_slots(db: Session, ids: list, as_of: datetime) -> list[_Slot]:
-    # A completed scan has already passed the scan executor's
-    # authorization re-check; queued/running/failed/cancelled scans prove
-    # nothing.
-    scans = {
-        scan.id: scan
-        for scan in db.query(Scan).filter(Scan.asset_id.in_(ids), Scan.status == ScanStatus.completed)
-        if scan.completed_at is None or scan.completed_at <= as_of
-    }
-    if not scans:
-        return []
-
-    slots: dict[tuple, _Slot] = {}
-    scans_with_rows: dict[str, set] = {PORT_SCANNER_MODULE: set(), SSL_MODULE: set()}
-    for row in db.query(PortScanResult).filter(PortScanResult.scan_id.in_(list(scans))):
-        scan = scans[row.scan_id]
-        if row.asset_id != scan.asset_id:
-            continue
-        scans_with_rows[PORT_SCANNER_MODULE].add(scan.id)
-        subject = f"{row.port}/{row.protocol}"
-        key = (scan.asset_id, EvidenceType.open_port, subject)
-        slot = slots.setdefault(
-            key, _Slot(asset_id=scan.asset_id, evidence_type=EvidenceType.open_port, source=f"scan:{PORT_SCANNER_MODULE}", subject=subject)
-        )
-        slot.attempts.append(_port_attempt(row, scan))
-    for row in db.query(SSLInfo).filter(SSLInfo.scan_id.in_(list(scans))):
-        scan = scans[row.scan_id]
-        if row.asset_id != scan.asset_id:
-            continue
-        scans_with_rows[SSL_MODULE].add(scan.id)
-        subject = f"{row.hostname}:{row.port}"
-        key = (scan.asset_id, EvidenceType.tls_handshake, subject, SSL_MODULE)
-        slot = slots.setdefault(
-            key, _Slot(asset_id=scan.asset_id, evidence_type=EvidenceType.tls_handshake, source=f"scan:{SSL_MODULE}", subject=subject)
-        )
-        slot.attempts.append(
-            _Attempt(at=scan.completed_at, result=AttemptResult.confirmed, result_id=row.id, scan_id=scan.id)
-        )
-
-    # A completed scan that ran a module but stored nothing for it means
-    # the module couldn't complete (blocked target, DNS failure, failed
-    # handshake) -- stored only as a free-text Finding, so inconclusive
-    # for everything that module had seen on that asset.
-    for scan in scans.values():
-        for module in (PORT_SCANNER_MODULE, SSL_MODULE):
-            if module in (scan.modules_requested or []) and scan.id not in scans_with_rows[module]:
-                for slot in slots.values():
-                    if slot.asset_id == scan.asset_id and slot.source == f"scan:{module}":
-                        slot.attempts.append(
-                            _Attempt(
-                                at=scan.completed_at,
-                                result=AttemptResult.inconclusive,
-                                note=f"the {module} scan module stored no result; {_FREE_TEXT_FAILURE}",
-                                scan_id=scan.id,
-                            )
-                        )
-    return list(slots.values())
+    if item.last_confirmed_at is not None and item.last_confirmed_at < window_start:
+        limitations.append("inconclusive attempts are counted within the freshness window only")
+    return replace(item, limitations=tuple(limitations))
 
 
 # --- classification -----------------------------------------------------------------
@@ -580,11 +805,17 @@ def _add_unattributed_http(evidence, observations, as_of: datetime, window: time
             )
 
 
-def _add_certificate_records(db: Session, ids: list, evidence) -> None:
+def _add_certificate_records(db: Session, ids: list, evidence, budget: _Budget) -> uuid.UUID | None:
     handshake_subjects = {
         (e.asset_id, e.subject) for items in evidence.values() for e in items if e.evidence_type is EvidenceType.tls_handshake
     }
-    for certificate in db.query(Certificate).filter(Certificate.asset_id.in_(ids)):
+    certificates, cut_at = budget.entities(
+        db,
+        db.query(Certificate)
+        .filter(Certificate.asset_id.in_(ids))
+        .order_by(Certificate.asset_id, Certificate.hostname, Certificate.port, Certificate.id),
+    )
+    for certificate in certificates:
         subject = f"{certificate.hostname}:{certificate.port}"
         if (certificate.asset_id, subject) in handshake_subjects:
             continue
@@ -602,6 +833,7 @@ def _add_certificate_records(db: Session, ids: list, evidence) -> None:
                 ),
             )
         )
+    return cut_at
 
 
 def _add_context_evidence(evidence, observations, as_of: datetime, window: timedelta) -> None:
@@ -634,8 +866,16 @@ def _add_context_evidence(evidence, observations, as_of: datetime, window: timed
             )
 
 
-def _assess_asset(asset: Asset, items: list[ExposureEvidence]) -> AssetExposure:
+def _assess_asset(
+    asset: Asset, items: list[ExposureEvidence], evidence_truncated: bool = False, notes: list[str] | None = None
+) -> AssetExposure:
     limitations: list[str] = []
+    if evidence_truncated:
+        limitations.append(
+            "the evidence budget was reached before this asset's evidence was fully examined: it may be missing "
+            "evidence, and nothing that couldn't be fully checked is treated as current"
+        )
+    limitations.extend(notes or ())
     inactive_reason = None
     if not asset.is_active:
         inactive_reason = "the asset is deactivated"
@@ -663,4 +903,5 @@ def _assess_asset(asset: Asset, items: list[ExposureEvidence]) -> AssetExposure:
         is_observed_entry_point=is_entry_point,
         evidence=tuple(items),
         limitations=tuple(limitations),
+        evidence_truncated=evidence_truncated,
     )

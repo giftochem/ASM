@@ -184,6 +184,15 @@ def observed_dns(db, org, user, source: Asset, target: Asset, *, status=Lifecycl
     return relate(db, source, target, RelationshipType.resolves_to, status=status, confidence=confidence)
 
 
+def analyst_link(db, org, user, source: Asset, target: Asset, relationship_type: RelationshipType, *, at=None,
+                 status=LifecycleStatus.active) -> AssetRelationship:
+    """An analyst-entered relationship with its creation audit record --
+    what POST /assets/{id}/relationships writes."""
+    relationship = relate(db, source, target, relationship_type, source_kind=AssetSource.manual, status=status)
+    creation_audit(db, org, user, relationship, at=at)
+    return relationship
+
+
 def creation_audit(db, org, user, relationship: AssetRelationship, *, at=None) -> AuditLog:
     entry = AuditLog(user_id=user.id, organization_id=org.id, action="asset.relationship.create",
                      resource_type="asset_relationship", resource_id=relationship.id, created_at=at or ago(days=3))

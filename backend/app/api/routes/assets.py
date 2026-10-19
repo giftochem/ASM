@@ -41,9 +41,21 @@ from app.schemas.graph import (
     GraphTraversalMetadata,
     SharedInfrastructureGroup,
 )
+from app.schemas.exposure_path import (
+    AnalystAssertionRef,
+    DnsEvidenceRef,
+    EntryEvidenceRef,
+    ExposurePathLimits,
+    ExposurePathRead,
+    ExposurePathsResponse,
+    PathAssetRef,
+    PathStepRead,
+    PathTruncation,
+)
 from app.schemas.risk import AssetPriority, PriorityDimensions, PriorityReason
 from app.services import (
     asset_relationship_service,
+    attack_path_service,
     audit_service,
     discovery_normalization_service,
     graph_service,
@@ -260,6 +272,142 @@ def get_prioritized_assets(
         limit=limit,
     )
     return [_to_asset_priority(r) for r in results]
+
+
+def _path_asset_ref(asset: attack_path_service.PathAsset) -> PathAssetRef:
+    return PathAssetRef(
+        asset_id=asset.asset_id,
+        asset_type=asset.asset_type,
+        value=asset.value,
+        criticality=asset.criticality,
+        environment=asset.environment,
+    )
+
+
+def _path_step_read(step: attack_path_service.PathStep) -> PathStepRead:
+    provenance = step.provenance
+    dns = provenance.dns_evidence
+    return PathStepRead(
+        relationship_id=step.relationship_id,
+        relationship_type=step.relationship_type,
+        from_asset_id=step.from_asset_id,
+        to_asset_id=step.to_asset_id,
+        direction=step.direction,
+        basis=step.basis,
+        relationship_source=provenance.source,
+        rule=step.rule,
+        reason=step.reason,
+        dns_evidence=(
+            DnsEvidenceRef(
+                result_id=dns.result_id,
+                discovery_run_id=dns.discovery_run_id,
+                observed_at=dns.observed_at,
+                record_type=dns.record_type,
+                freshness="current",
+            )
+            if step.basis is attack_path_service.StepBasis.observed_dns_association and dns is not None
+            else None
+        ),
+        analyst_assertion=(
+            AnalystAssertionRef(audit_log_id=provenance.audit_log_id, asserted_at=provenance.entered_at)
+            if step.basis is attack_path_service.StepBasis.analyst_asserted and provenance.audit_log_id is not None
+            else None
+        ),
+    )
+
+
+def _to_exposure_paths_response(result: attack_path_service.ExposurePathResult) -> ExposurePathsResponse:
+    return ExposurePathsResponse(
+        disclaimer=attack_path_service.DISCLAIMER,
+        organization_id=result.organization_id,
+        assessed_at=result.assessed_at,
+        freshness_window_seconds=int(result.freshness_window.total_seconds()),
+        limits=ExposurePathLimits(
+            max_hops=result.limits.max_hops,
+            max_targets=result.limits.max_targets,
+            max_paths=result.limits.max_paths,
+            max_nodes=result.limits.max_nodes,
+        ),
+        path_count=len(result.paths),
+        eligible_target_count=result.eligible_target_count,
+        examined_target_count=result.examined_target_count,
+        examined_node_count=result.examined_node_count,
+        evaluated_relationship_count=result.evaluated_relationship_count,
+        entry_point_count=result.entry_point_count,
+        truncated=result.truncated,
+        truncation_reasons=[PathTruncation(limit=t.limit, detail=t.detail) for t in result.truncations],
+        limitations=list(result.limitations),
+        paths=[
+            ExposurePathRead(
+                entry_point=_path_asset_ref(path.entry_point),
+                target=_path_asset_ref(path.target),
+                hop_count=path.hop_count,
+                is_zero_hop=path.is_zero_hop,
+                basis=path.basis,
+                nodes=[_path_asset_ref(node) for node in path.nodes],
+                steps=[_path_step_read(step) for step in path.steps],
+                entry_evidence=[
+                    EntryEvidenceRef(
+                        evidence_type=e.evidence_type.value,
+                        source=e.source,
+                        subject=e.subject,
+                        freshness=e.freshness.value,
+                        first_confirmed_at=e.first_confirmed_at,
+                        last_confirmed_at=e.last_confirmed_at,
+                        latest_attempt_at=e.latest_attempt_at,
+                        inconclusive_attempts=e.inconclusive_attempts,
+                        latest_inconclusive_at=e.latest_inconclusive_at,
+                        discovery_run_id=e.discovery_run_id,
+                        scan_id=e.scan_id,
+                        result_id=e.result_id,
+                        observation_id=e.observation_id,
+                        limitations=list(e.limitations),
+                    )
+                    for e in path.entry_evidence
+                ],
+                interpretation=path.interpretation,
+                limitations=list(path.limitations),
+            )
+            for path in result.paths
+        ],
+    )
+
+
+# Static, so registered before /{asset_id} below (see the note on the
+# other static routes above).
+@router.get("/exposure-paths", response_model=ExposurePathsResponse)
+def get_exposure_paths(
+    as_of: datetime | None = None,
+    max_hops: int = attack_path_service.MAX_HOPS,
+    max_targets: int = attack_path_service.MAX_TARGETS,
+    max_paths: int = attack_path_service.MAX_PATHS,
+    max_nodes: int = attack_path_service.MAX_NODES,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExposurePathsResponse:
+    """Stage B: observed exposure paths from assets with current
+    service-exposure evidence to assets explicitly marked high or
+    critical -- observed exposure, NOT verified exploit chains. See
+    attack_path_service for the model. Read-only for every role: it
+    never writes, never triggers discovery or scanning, and never
+    touches the network.
+
+    Limits follow GET /{asset_id}/graph's traversal-bound convention: a
+    well-formed value outside its range is a 400 naming the range; a
+    malformed value (not an integer, not a datetime) is FastAPI's own
+    422. `as_of` defaults to now; it must carry a timezone and can't be
+    in the future (400).
+    """
+    try:
+        limits = attack_path_service.validate_limits(max_hops, max_targets, max_paths, max_nodes)
+        assessed_at = attack_path_service.resolve_assessment_time(as_of, datetime.now(timezone.utc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    result = attack_path_service.find_exposure_paths(
+        db, current_user.organization_id, as_of=assessed_at, limits=limits
+    )
+    return _to_exposure_paths_response(result)
 
 
 @router.get("/{asset_id}", response_model=AssetRead)
