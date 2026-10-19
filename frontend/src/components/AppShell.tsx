@@ -33,6 +33,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/changes", label: "Change Timeline" },
       { to: "/prioritized", label: "Prioritized Assets" },
+      { to: "/exposure-paths", label: "Exposure Paths" },
     ],
   },
   {

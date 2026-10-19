@@ -9,6 +9,7 @@ import { RequireAuth } from "./auth/RequireAuth";
 import { RequireRole } from "./auth/RequireRole";
 import { AppShell } from "./components/AppShell";
 import { AlertsPage } from "./pages/AlertsPage";
+import { ExposurePathsPage } from "./pages/ExposurePathsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { UsersPage } from "./pages/settings/UsersPage";
 
@@ -44,6 +45,7 @@ function renderRouteTreeAt(route: string) {
         }
       >
         <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/exposure-paths" element={<ExposurePathsPage />} />
         <Route
           path="/settings"
           element={
@@ -85,6 +87,24 @@ describe("protected routes (routes.tsx composition)", () => {
     // page is actually rendering inside the shared shell, not standalone.
     await waitFor(() => expect(screen.getByRole("link", { name: "Overview" })).toBeInTheDocument());
     expect(screen.getByRole("heading", { name: "Alerts" })).toBeInTheDocument();
+  });
+
+  it("serves /exposure-paths inside AppShell for any authenticated role, and only then", async () => {
+    mockedUseAuth.mockReturnValue({ user: null, isLoading: false, isAuthenticated: false });
+    const { unmount } = renderRouteTreeAt("/exposure-paths");
+    await waitFor(() => expect(screen.getByRole("heading", { name: /log in/i })).toBeInTheDocument());
+    unmount();
+
+    mockedUseAuth.mockReturnValue({
+      user: { id: "u2", email: "viewer@example.com", organization_id: "org-1", role: "viewer" } as never,
+      isLoading: false,
+      isAuthenticated: true,
+    });
+    server.use(http.get("/assets/exposure-paths", () => HttpResponse.json({ detail: "Service temporarily unavailable" }, { status: 503 })));
+    renderRouteTreeAt("/exposure-paths");
+
+    await waitFor(() => expect(screen.getByRole("link", { name: "Exposure Paths" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Exposure Paths" })).toBeInTheDocument();
   });
 
   it("still gates /settings behind RequireRole(['admin']) within the restructured tree", async () => {

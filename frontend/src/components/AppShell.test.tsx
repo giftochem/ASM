@@ -22,7 +22,7 @@ describe("AppShell", () => {
     mockAuth(adminUser);
     renderWithProviders(<AppShell />);
 
-    for (const label of ["Overview", "Attack Surface", "Change Timeline", "Prioritized Assets", "Alerts", "Monitoring", "Scans", "Findings", "Reports"]) {
+    for (const label of ["Overview", "Attack Surface", "Change Timeline", "Prioritized Assets", "Exposure Paths", "Alerts", "Monitoring", "Scans", "Findings", "Reports"]) {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
   });

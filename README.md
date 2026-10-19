@@ -1470,6 +1470,20 @@ role; no write, no discovery, no scan, no network access.
   criticality and relationships are current stored state even for a
   past `as_of`; only evidence is evaluated point-in-time.
 
+**Exposure Paths page (Stage C)** — `/exposure-paths` (nav: Understand &
+Prioritize). A read-only view of the endpoint above for every role:
+summary (paths returned, high/critical targets, observed entry points,
+assessment time, complete vs truncated), the paths in API order, and
+per-path details (assets, ordered relationship steps with DNS evidence
+or analyst-assertion references, entry-point evidence with freshness and
+inconclusive attempts, interpretation, limitations). Controls: max hops
+(0–3), max paths, and a manual Refresh that only re-evaluates stored
+evidence — no polling, no discovery, no historical date picker. Empty
+states distinguish "no assets marked high/critical", "no current entry
+points" and "no permitted path", and a truncated result is never shown
+as a conclusion. The disclaimer "Observed exposure paths; exploitability
+not assessed." is always shown.
+
 ### SSRF hardening
 
 `app/scanners/net_safety.py` resolves a target hostname (all A/AAAA

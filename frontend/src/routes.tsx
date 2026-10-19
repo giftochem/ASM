@@ -11,6 +11,7 @@ import { AssetDetailPage } from "./pages/AssetDetailPage";
 import { ChangeTimelinePage } from "./pages/ChangeTimelinePage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { PrioritizedAssetsPage } from "./pages/PrioritizedAssetsPage";
+import { ExposurePathsPage } from "./pages/ExposurePathsPage";
 import { MonitoringPage } from "./pages/MonitoringPage";
 import { ScansPage } from "./pages/ScansPage";
 import { ScanDetailPage } from "./pages/ScanDetailPage";
@@ -40,6 +41,7 @@ export const router = createBrowserRouter([
       { path: "changes", element: <ChangeTimelinePage /> },
       { path: "alerts", element: <AlertsPage /> },
       { path: "prioritized", element: <PrioritizedAssetsPage /> },
+      { path: "exposure-paths", element: <ExposurePathsPage /> },
       { path: "monitoring", element: <MonitoringPage /> },
       { path: "scans", element: <ScansPage /> },
       { path: "scans/:scanId", element: <ScanDetailPage /> },

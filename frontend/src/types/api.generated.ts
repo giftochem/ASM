@@ -267,6 +267,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/assets/exposure-paths": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Exposure Paths
+         * @description Stage B: observed exposure paths from assets with current
+         *     service-exposure evidence to assets explicitly marked high or
+         *     critical -- observed exposure, NOT verified exploit chains. See
+         *     attack_path_service for the model. Read-only for every role: it
+         *     never writes, never triggers discovery or scanning, and never
+         *     touches the network.
+         *
+         *     Limits follow GET /{asset_id}/graph's traversal-bound convention: a
+         *     well-formed value outside its range is a 400 naming the range; a
+         *     malformed value (not an integer, not a datetime) is FastAPI's own
+         *     422. `as_of` defaults to now; it must carry a timezone and can't be
+         *     in the future (400).
+         */
+        get: operations["get_exposure_paths_assets_exposure_paths_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/assets/{asset_id}": {
         parameters: {
             query?: never;
@@ -1025,6 +1056,23 @@ export interface components {
          */
         AlertType: "new_externally_exposed_asset" | "important_asset_disappeared" | "important_asset_reappeared" | "certificate_changed" | "dns_infrastructure_changed" | "http_security_posture_changed" | "infrastructure_classification_changed" | "high_priority_asset_detected" | "authorization_disabled";
         /**
+         * AnalystAssertionRef
+         * @description The audit record behind an analyst-asserted step. Who entered it
+         *     is in that audit record (admin-only), not repeated here.
+         */
+        AnalystAssertionRef: {
+            /**
+             * Audit Log Id
+             * Format: uuid
+             */
+            audit_log_id: string;
+            /**
+             * Asserted At
+             * Format: date-time
+             */
+            asserted_at: string;
+        };
+        /**
          * AssetAuthorizationConfirm
          * @description The client must explicitly send authorization_confirmed=true; there
          *     is no implicit/default path to True. Kept as its own schema/endpoint
@@ -1544,6 +1592,136 @@ export interface components {
             /** Interval Hours */
             interval_hours?: number | null;
         };
+        /**
+         * DnsEvidenceRef
+         * @description The dns discovery result behind an observed resolves_to step --
+         *     no older than the freshness window at the assessment time.
+         */
+        DnsEvidenceRef: {
+            /**
+             * Result Id
+             * Format: uuid
+             */
+            result_id: string;
+            /**
+             * Discovery Run Id
+             * Format: uuid
+             */
+            discovery_run_id: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Record Type */
+            record_type: string | null;
+            /** Freshness */
+            freshness: string;
+        };
+        /**
+         * EntryEvidenceRef
+         * @description One piece of the entry point's qualifying exposure evidence -- see
+         *     exposure_evidence_service for what each field means.
+         */
+        EntryEvidenceRef: {
+            /** Evidence Type */
+            evidence_type: string;
+            /** Source */
+            source: string;
+            /** Subject */
+            subject: string;
+            /** Freshness */
+            freshness: string;
+            /** First Confirmed At */
+            first_confirmed_at: string | null;
+            /** Last Confirmed At */
+            last_confirmed_at: string | null;
+            /** Latest Attempt At */
+            latest_attempt_at: string | null;
+            /** Inconclusive Attempts */
+            inconclusive_attempts: number;
+            /** Latest Inconclusive At */
+            latest_inconclusive_at: string | null;
+            /** Discovery Run Id */
+            discovery_run_id: string | null;
+            /** Scan Id */
+            scan_id: string | null;
+            /** Result Id */
+            result_id: string | null;
+            /** Observation Id */
+            observation_id: string | null;
+            /** Limitations */
+            limitations: string[];
+        };
+        /** ExposurePathLimits */
+        ExposurePathLimits: {
+            /** Max Hops */
+            max_hops: number;
+            /** Max Targets */
+            max_targets: number;
+            /** Max Paths */
+            max_paths: number;
+            /** Max Nodes */
+            max_nodes: number;
+        };
+        /** ExposurePathRead */
+        ExposurePathRead: {
+            entry_point: components["schemas"]["PathAssetRef"];
+            target: components["schemas"]["PathAssetRef"];
+            /** Hop Count */
+            hop_count: number;
+            /** Is Zero Hop */
+            is_zero_hop: boolean;
+            basis: components["schemas"]["PathBasis"];
+            /** Nodes */
+            nodes: components["schemas"]["PathAssetRef"][];
+            /** Steps */
+            steps: components["schemas"]["PathStepRead"][];
+            /** Entry Evidence */
+            entry_evidence: components["schemas"]["EntryEvidenceRef"][];
+            /** Interpretation */
+            interpretation: string;
+            /** Limitations */
+            limitations: string[];
+        };
+        /** ExposurePathsResponse */
+        ExposurePathsResponse: {
+            /** Disclaimer */
+            disclaimer: string;
+            /**
+             * Organization Id
+             * Format: uuid
+             */
+            organization_id: string;
+            /**
+             * Assessed At
+             * Format: date-time
+             */
+            assessed_at: string;
+            /** Freshness Window Seconds */
+            freshness_window_seconds: number;
+            limits: components["schemas"]["ExposurePathLimits"];
+            /** Path Count */
+            path_count: number;
+            /** Eligible Target Count */
+            eligible_target_count: number;
+            /** Examined Target Count */
+            examined_target_count: number;
+            /** Examined Node Count */
+            examined_node_count: number;
+            /** Evaluated Relationship Count */
+            evaluated_relationship_count: number;
+            /** Entry Point Count */
+            entry_point_count: number;
+            /** Truncated */
+            truncated: boolean;
+            /** Truncation Reasons */
+            truncation_reasons: components["schemas"]["PathTruncation"][];
+            /** Limitations */
+            limitations: string[];
+            /** Paths */
+            paths: components["schemas"]["ExposurePathRead"][];
+        };
         /** FindingRead */
         FindingRead: {
             /**
@@ -1729,6 +1907,60 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+        };
+        /** PathAssetRef */
+        PathAssetRef: {
+            /**
+             * Asset Id
+             * Format: uuid
+             */
+            asset_id: string;
+            asset_type: components["schemas"]["AssetType"];
+            /** Value */
+            value: string;
+            criticality: components["schemas"]["AssetCriticality"] | null;
+            environment: components["schemas"]["AssetEnvironment"] | null;
+        };
+        /**
+         * PathBasis
+         * @enum {string}
+         */
+        PathBasis: "direct_exposure" | "observed_dns_association" | "analyst_asserted" | "observed_dns_and_analyst_asserted";
+        /** PathStepRead */
+        PathStepRead: {
+            /**
+             * Relationship Id
+             * Format: uuid
+             */
+            relationship_id: string;
+            relationship_type: components["schemas"]["RelationshipType"];
+            /**
+             * From Asset Id
+             * Format: uuid
+             */
+            from_asset_id: string;
+            /**
+             * To Asset Id
+             * Format: uuid
+             */
+            to_asset_id: string;
+            /** Direction */
+            direction: string;
+            basis: components["schemas"]["StepBasis"];
+            relationship_source: components["schemas"]["AssetSource"];
+            /** Rule */
+            rule: string;
+            /** Reason */
+            reason: string;
+            dns_evidence: components["schemas"]["DnsEvidenceRef"] | null;
+            analyst_assertion: components["schemas"]["AnalystAssertionRef"] | null;
+        };
+        /** PathTruncation */
+        PathTruncation: {
+            /** Limit */
+            limit: string;
+            /** Detail */
+            detail: string;
         };
         /** PriorityDimensions */
         PriorityDimensions: {
@@ -1966,6 +2198,11 @@ export interface components {
             /** Assets */
             assets: components["schemas"]["SharedInfrastructureAssetRef"][];
         };
+        /**
+         * StepBasis
+         * @enum {string}
+         */
+        StepBasis: "observed_dns_association" | "analyst_asserted";
         /** UserCreate */
         UserCreate: {
             /**
@@ -2424,6 +2661,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AssetPriority"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_exposure_paths_assets_exposure_paths_get: {
+        parameters: {
+            query?: {
+                as_of?: string | null;
+                max_hops?: number;
+                max_targets?: number;
+                max_paths?: number;
+                max_nodes?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExposurePathsResponse"];
                 };
             };
             /** @description Validation Error */
