@@ -11,6 +11,7 @@ export type GraphNode = components["schemas"]["GraphNode"];
 export type GraphEdge = components["schemas"]["GraphEdge"];
 export type AssetRelationship = components["schemas"]["AssetRelationshipRead"];
 export type Observation = components["schemas"]["ObservationRead"];
+export type AssetUpdatePayload = components["schemas"]["AssetUpdate"];
 
 export interface CreateAssetPayload {
   asset_type: AssetType;
@@ -74,6 +75,13 @@ export function confirmAuthorization(assetId: string, payload: ConfirmAuthorizat
 
 export function revokeAuthorization(assetId: string, payload: RevokeAuthorizationPayload): Promise<Asset> {
   return apiFetch<Asset>(`/assets/${assetId}/revoke-authorization`, { method: "POST", body: payload });
+}
+
+// Stage A.1: human-set business context only -- criticality and
+// environment. The server rejects any other field. Send just the fields
+// being changed; null clears a value.
+export function updateAsset(assetId: string, payload: AssetUpdatePayload): Promise<Asset> {
+  return apiFetch<Asset>(`/assets/${assetId}`, { method: "PATCH", body: payload });
 }
 
 // Step 9.13: N-hop neighborhood graph for one asset (Step 9.8's existing

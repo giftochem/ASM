@@ -33,6 +33,27 @@ class AssetCreate(BaseModel):
         return self
 
 
+class AssetUpdate(BaseModel):
+    """PATCH /assets/{asset_id} (Stage A.1). Deliberately narrow: only the
+    human-set business context -- criticality and environment -- can be
+    changed here. Any other field is rejected (extra="forbid") rather than
+    ignored, so a request can't even appear to change an asset's identity,
+    organization, authorization status, lifecycle or discovery evidence.
+    An absent field is left untouched; a field sent as null clears the
+    value back to unset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    criticality: AssetCriticality | None = None
+    environment: AssetEnvironment | None = None
+
+    @model_validator(mode="after")
+    def _require_a_field(self) -> "AssetUpdate":
+        if not self.model_fields_set:
+            raise ValueError("provide at least one of: criticality, environment")
+        return self
+
+
 class AssetRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

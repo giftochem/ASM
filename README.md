@@ -1376,6 +1376,30 @@ alerting steps' existing, already-tested endpoints.
   build, and real HTTP calls through the actual dev proxy into the real
   backend, not a human or automated click-through of the rendered UI.
 
+**Asset business context (Stage A.1)** — criticality and environment,
+the two human-set inputs prioritization reads, are now editable. No new
+model, table, migration or dependency.
+
+- **`PATCH /assets/{id}`** (admin/analyst; a viewer gets 403; another
+  organization's asset is a 404) accepts only `criticality` and/or
+  `environment`, each an existing enum value or `null` to clear it. Any
+  other field (identity, organization, authorization, lifecycle,
+  discovery evidence) is a 422, never silently ignored, as is an empty
+  body. Authorization still changes only through
+  `confirm-authorization`/`revoke-authorization`.
+- **Recorded atomically**: a change writes an `asset_updated`
+  Observation (`field_name="asset_state"`, before/after JSON of just the
+  changed fields, the shape discovery's asset refreshes already use) and
+  an `asset.update` audit entry, committed with the change in one
+  transaction. An update that changes nothing writes nothing.
+- **Priority follows on the next read**: `GET /assets/{id}/risk` and
+  `GET /assets/prioritized` compute from the stored values on demand, so
+  there is no second scoring path or cache to update.
+- **UI**: the Asset Detail page's Identity section shows both values;
+  admins and analysts get selects and Save, viewers read only. A save
+  refreshes the asset's priority, change history and graph, plus the
+  asset lists, prioritized list, activity feed and summary.
+
 ### SSRF hardening
 
 `app/scanners/net_safety.py` resolves a target hostname (all A/AAAA
@@ -1893,9 +1917,10 @@ accuracy, and a dependency/security scan.
   this reason.
 - `AssetType.web3_*`/`rpc_endpoint` are reserved the same way — no Web3
   implementation exists yet, by explicit instruction for this pass.
-- No write endpoints for `Asset.environment`/`criticality`/`owner`/`tags`
-  yet — currently settable only via direct DB access, readable via
-  `GET /assets`.
+- No write endpoints for `Asset.owner`/`tags` yet — currently settable
+  only via direct DB access, readable via `GET /assets`.
+  (`environment`/`criticality` are writable via `PATCH /assets/{id}`
+  since Stage A.1.)
 - `Observation` only records what this pass's own code paths produce
   (asset/relationship creation and removal) — no generic field-level
   diffing (IP changed, DNS changed, port opened/closed, ...) exists yet;
@@ -2102,10 +2127,10 @@ accuracy, and a dependency/security scan.
 
 ```
 docker compose run --rm app pytest
-================= 763 passed, 1 skipped, 0 failed =================
+================= 930 passed, 1 skipped, 0 failed =================
 
 cd frontend && npx vitest run
-================= 47 test files, 285 tests passed =================
+================= 48 test files, 294 tests passed =================
 
 cd frontend && npm run build
 ================= tsc --noEmit && vite build -- succeeds =================
@@ -2125,4 +2150,5 @@ Frontend count grew from 230 (39 files) to 285 (47 files) in Step 9.13 —
 `PrioritizedAssetsPage`, `MonitoringPage`, `GraphView`, `AppShell`,
 `routes` composition), plus updates to every existing test whose fixture
 shape changed when `types/api.generated.ts` was regenerated against the
-now much larger live OpenAPI schema.
+now much larger live OpenAPI schema. Stage A.1 added 9 more (285 to 294,
+one new file, `hooks/useUpdateAsset.test.tsx`).

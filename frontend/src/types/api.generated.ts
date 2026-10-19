@@ -281,7 +281,22 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Update Asset
+         * @description Stage A.1: human-set business context only (criticality,
+         *     environment) -- see AssetUpdate for what's deliberately not updatable.
+         *
+         *     The row is locked (SELECT ... FOR UPDATE) within the caller's
+         *     organization, so concurrent updates serialize and each one's recorded
+         *     before-values are exactly what it replaced; a cross-organization id is
+         *     a 404, like every other org-scoped lookup. The field change, its
+         *     asset_updated Observation (the same field_name="asset_state" JSON shape
+         *     discovery's own asset refreshes use) and its audit entry are committed
+         *     together or not at all. An update that changes nothing writes nothing.
+         *     Priority is computed on demand from the stored values, so it reflects
+         *     the change on the next read with no extra step.
+         */
+        patch: operations["update_asset_assets__asset_id__patch"];
         trace?: never;
     };
     "/assets/{asset_id}/revoke-authorization": {
@@ -627,7 +642,9 @@ export interface paths {
          *     frontend-side. No role restriction, matching every other read
          *     endpoint in this router; `current_user` is required only for
          *     authentication, not used otherwise (this data is identical across
-         *     every organization).
+         *     every organization). Lists only providers available in this
+         *     deployment -- a test-only provider (e.g. `stub`) is absent unless
+         *     explicitly enabled (see app/discovery/registry.py).
          */
         get: operations["list_providers_discovery_providers_get"];
         put?: never;
@@ -992,11 +1009,18 @@ export interface components {
          *     the dedicated important_asset_reappeared type) -- value/asset_type/
          *     source/environment/criticality/owner/tags can never differ between
          *     its two snapshots, since nothing else in the function touches them
-         *     (and there is still no write endpoint for criticality/owner/tags --
+         *     (and there was then no write endpoint for criticality/owner/tags --
          *     a disclosed gap since Step 8.1/9.5). Shipping a type with no
          *     reachable trigger would violate this taxonomy's own "only types
          *     backed by actual existing intelligence" rule, so it was cut rather
          *     than kept as dead code.
+         *
+         *     Stage A.1 made asset_updated reachable: PATCH /assets/{id} records
+         *     one when someone changes an asset's criticality or environment. It
+         *     still maps to no alert type -- that change is the organization's own
+         *     deliberate, audited classification, not new intelligence about the
+         *     asset. Its effect on alerting is indirect: later discovery runs see
+         *     the asset's new priority and business context.
          * @enum {string}
          */
         AlertType: "new_externally_exposed_asset" | "important_asset_disappeared" | "important_asset_reappeared" | "certificate_changed" | "dns_infrastructure_changed" | "http_security_posture_changed" | "infrastructure_classification_changed" | "high_priority_asset_detected" | "authorization_disabled";
@@ -1223,6 +1247,20 @@ export interface components {
          * @enum {string}
          */
         AssetType: "domain" | "subdomain" | "ip_address" | "ip_range" | "url" | "asn" | "service" | "http_endpoint" | "tls_certificate" | "api" | "cloud_resource" | "repository" | "web3_contract" | "web3_program" | "web3_token" | "web3_wallet" | "rpc_endpoint";
+        /**
+         * AssetUpdate
+         * @description PATCH /assets/{asset_id} (Stage A.1). Deliberately narrow: only the
+         *     human-set business context -- criticality and environment -- can be
+         *     changed here. Any other field is rejected (extra="forbid") rather than
+         *     ignored, so a request can't even appear to change an asset's identity,
+         *     organization, authorization status, lifecycle or discovery evidence.
+         *     An absent field is left untouched; a field sent as null clears the
+         *     value back to unset.
+         */
+        AssetUpdate: {
+            criticality?: components["schemas"]["AssetCriticality"] | null;
+            environment?: components["schemas"]["AssetEnvironment"] | null;
+        };
         /**
          * AttackSurfaceSummary
          * @description Descriptive inventory statistics only -- explicitly not a risk
@@ -2409,6 +2447,41 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetRead"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_asset_assets__asset_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                asset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssetUpdate"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

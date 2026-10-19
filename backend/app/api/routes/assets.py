@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -6,7 +7,15 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.core.client_ip import get_client_ip
-from app.core.enums import AssetCriticality, AssetEnvironment, AssetType, ChangeType, LifecycleStatus, UserRole
+from app.core.enums import (
+    AssetCriticality,
+    AssetEnvironment,
+    AssetSource,
+    AssetType,
+    ChangeType,
+    LifecycleStatus,
+    UserRole,
+)
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.asset import Asset
@@ -20,6 +29,7 @@ from app.schemas.asset import (
     AssetRead,
     AssetRelationshipCreate,
     AssetRelationshipRead,
+    AssetUpdate,
     ObservationRead,
 )
 from app.schemas.graph import (
@@ -259,6 +269,81 @@ def get_asset(
     db: Session = Depends(get_db),
 ) -> Asset:
     return _get_org_asset_or_404(db, asset_id, current_user.organization_id)
+
+
+def _enum_value(value) -> str | None:
+    return value.value if value is not None else None
+
+
+# PATCH on the path-param route can't shadow the static GET routes above
+# (/activity, /summary, /shared-infrastructure, /prioritized): a different
+# method never matches them, and PATCH on one of those names is a 422
+# (not a UUID), not a call to some other handler.
+@router.patch("/{asset_id}", response_model=AssetRead)
+def update_asset(
+    asset_id: uuid.UUID,
+    payload: AssetUpdate,
+    request: Request,
+    current_user: User = Depends(require_role(UserRole.admin, UserRole.analyst)),
+    db: Session = Depends(get_db),
+) -> Asset:
+    """Stage A.1: human-set business context only (criticality,
+    environment) -- see AssetUpdate for what's deliberately not updatable.
+
+    The row is locked (SELECT ... FOR UPDATE) within the caller's
+    organization, so concurrent updates serialize and each one's recorded
+    before-values are exactly what it replaced; a cross-organization id is
+    a 404, like every other org-scoped lookup. The field change, its
+    asset_updated Observation (the same field_name="asset_state" JSON shape
+    discovery's own asset refreshes use) and its audit entry are committed
+    together or not at all. An update that changes nothing writes nothing.
+    Priority is computed on demand from the stored values, so it reflects
+    the change on the next read with no extra step.
+    """
+    asset = (
+        db.query(Asset)
+        .filter(Asset.id == asset_id, Asset.organization_id == current_user.organization_id)
+        .with_for_update()
+        .populate_existing()
+        .one_or_none()
+    )
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
+
+    requested = {field: getattr(payload, field) for field in payload.model_fields_set}
+    before = {field: _enum_value(getattr(asset, field)) for field in requested}
+    after = {field: _enum_value(value) for field, value in requested.items()}
+    changed = sorted(field for field in requested if before[field] != after[field])
+
+    try:
+        if changed:
+            for field in changed:
+                setattr(asset, field, requested[field])
+            observation_service.record_observation(
+                db,
+                asset,
+                ChangeType.asset_updated,
+                field_name="asset_state",
+                previous_value=json.dumps({field: before[field] for field in changed}),
+                current_value=json.dumps({field: after[field] for field in changed}),
+                source=AssetSource.manual,
+            )
+            audit_service.log_action(
+                db,
+                user_id=current_user.id,
+                organization_id=current_user.organization_id,
+                action="asset.update",
+                resource_type="asset",
+                resource_id=asset.id,
+                details={"changes": {field: {"from": before[field], "to": after[field]} for field in changed}},
+                ip_address=get_client_ip(request),
+            )
+        db.commit()  # also releases the row lock when nothing changed
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(asset)
+    return asset
 
 
 @router.post("", response_model=AssetRead, status_code=status.HTTP_201_CREATED)

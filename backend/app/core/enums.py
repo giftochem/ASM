@@ -244,11 +244,18 @@ class AlertType(str, enum.Enum):
     the dedicated important_asset_reappeared type) -- value/asset_type/
     source/environment/criticality/owner/tags can never differ between
     its two snapshots, since nothing else in the function touches them
-    (and there is still no write endpoint for criticality/owner/tags --
+    (and there was then no write endpoint for criticality/owner/tags --
     a disclosed gap since Step 8.1/9.5). Shipping a type with no
     reachable trigger would violate this taxonomy's own "only types
     backed by actual existing intelligence" rule, so it was cut rather
     than kept as dead code.
+
+    Stage A.1 made asset_updated reachable: PATCH /assets/{id} records
+    one when someone changes an asset's criticality or environment. It
+    still maps to no alert type -- that change is the organization's own
+    deliberate, audited classification, not new intelligence about the
+    asset. Its effect on alerting is indirect: later discovery runs see
+    the asset's new priority and business context.
     """
 
     new_externally_exposed_asset = "new_externally_exposed_asset"

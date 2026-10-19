@@ -78,8 +78,9 @@ const confirmedAsset = {
 
 const adminUser = { id: "u1", organization_id: "org-1", role: "admin" as const };
 const viewerUser = { id: "u2", organization_id: "org-1", role: "viewer" as const };
+const analystUser = { id: "u3", organization_id: "org-1", role: "analyst" as const };
 
-function mockAuth(user: typeof adminUser | typeof viewerUser) {
+function mockAuth(user: typeof adminUser | typeof viewerUser | typeof analystUser) {
   mockedUseAuth.mockReturnValue({ user: user as never, isLoading: false, isAuthenticated: true });
 }
 
@@ -402,5 +403,228 @@ describe("AssetDetailPage", () => {
     renderDetail();
     await waitFor(() => expect(screen.getByText("Authorized")).toBeInTheDocument());
     await waitFor(() => expect(screen.getAllByRole("alert").length).toBeGreaterThan(0));
+  });
+});
+
+describe("AssetDetailPage business context (Stage A.1)", () => {
+  const contextAsset = { ...confirmedAsset, criticality: "high" as const, environment: "staging" as const };
+
+  async function findBusinessContext() {
+    return (await screen.findByRole("heading", { name: "Business context" })).parentElement as HTMLElement;
+  }
+
+  it("shows criticality and environment read-only to a viewer", async () => {
+    mockAuth(viewerUser);
+    server.use(http.get("/assets/:id", () => HttpResponse.json(contextAsset)));
+
+    renderDetail();
+    const block = await findBusinessContext();
+
+    expect(within(block).getByText("high")).toBeInTheDocument();
+    expect(within(block).getByText("staging")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Criticality" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Environment" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("lets an admin change criticality: sends only that field, shows saving then success, and refreshes priority and history", async () => {
+    mockAuth(adminUser);
+    let patchedBody: unknown = null;
+    let riskCalls = 0;
+    let observationCalls = 0;
+    let releasePatch!: () => void;
+    const patchGate = new Promise<void>((resolve) => {
+      releasePatch = resolve;
+    });
+    server.use(
+      http.get("/assets/:id", () => HttpResponse.json(contextAsset)),
+      http.get(`/assets/${ASSET_ID}/risk`, () => {
+        riskCalls += 1;
+        return HttpResponse.json(
+          riskCalls === 1
+            ? fakeRisk
+            : {
+                ...fakeRisk,
+                priority: "critical",
+                reasons: [{ signal: "business_criticality", impact: "high", description: "Marked critical by your organization" }],
+              },
+        );
+      }),
+      http.get(`/assets/${ASSET_ID}/observations`, () => {
+        observationCalls += 1;
+        return HttpResponse.json([]);
+      }),
+      http.patch("/assets/:id", async ({ request }) => {
+        patchedBody = await request.json();
+        await patchGate;
+        return HttpResponse.json({ ...contextAsset, criticality: "critical" });
+      }),
+    );
+    const user = userEvent.setup();
+
+    renderDetail();
+    const criticality = await screen.findByRole("combobox", { name: "Criticality" });
+    const save = screen.getByRole("button", { name: "Save" });
+    expect(criticality).toHaveValue("high");
+    expect(screen.getByRole("combobox", { name: "Environment" })).toHaveValue("staging");
+    expect(save).toBeDisabled();
+    await waitFor(() => expect(riskCalls).toBe(1));
+    await waitFor(() => expect(observationCalls).toBe(1));
+
+    await user.selectOptions(criticality, "critical");
+    expect(save).toBeEnabled();
+    await user.click(save);
+
+    expect(await screen.findByRole("button", { name: "Saving..." })).toBeDisabled();
+    expect(criticality).toBeDisabled();
+    releasePatch();
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Business context saved."));
+    expect(patchedBody).toEqual({ criticality: "critical" });
+    expect(criticality).toHaveValue("critical");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(await screen.findByText("Marked critical by your organization")).toBeInTheDocument();
+    expect(riskCalls).toBe(2);
+    await waitFor(() => expect(observationCalls).toBe(2));
+  });
+
+  it("lets an analyst edit too, sending a cleared value as null", async () => {
+    mockAuth(analystUser);
+    let patchedBody: unknown = null;
+    server.use(
+      http.get("/assets/:id", () => HttpResponse.json(contextAsset)),
+      http.patch("/assets/:id", async ({ request }) => {
+        patchedBody = await request.json();
+        return HttpResponse.json({ ...contextAsset, criticality: null, environment: "production" });
+      }),
+    );
+    const user = userEvent.setup();
+
+    renderDetail();
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Criticality" }), "Not set");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Environment" }), "production");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Business context saved."));
+    expect(patchedBody).toEqual({ criticality: null, environment: "production" });
+    expect(screen.getByRole("combobox", { name: "Criticality" })).toHaveValue("");
+    expect(screen.getByRole("combobox", { name: "Environment" })).toHaveValue("production");
+  });
+
+  it("only enables Save while a value differs from what's stored", async () => {
+    mockAuth(adminUser);
+    server.use(http.get("/assets/:id", () => HttpResponse.json(contextAsset)));
+    const user = userEvent.setup();
+
+    renderDetail();
+    const environment = await screen.findByRole("combobox", { name: "Environment" });
+    const save = screen.getByRole("button", { name: "Save" });
+    expect(save).toBeDisabled();
+
+    await user.selectOptions(environment, "production");
+    expect(save).toBeEnabled();
+
+    await user.selectOptions(environment, "staging");
+    expect(save).toBeDisabled();
+  });
+
+  it("shows the server's validation message on a 422 and keeps the selection for a retry", async () => {
+    mockAuth(adminUser);
+    const message = "Input should be 'production', 'staging', 'development', 'test' or 'unknown'";
+    server.use(
+      http.get("/assets/:id", () => HttpResponse.json(contextAsset)),
+      http.patch("/assets/:id", () =>
+        HttpResponse.json({ detail: [{ type: "enum", loc: ["body", "environment"], msg: message }] }, { status: 422 }),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderDetail();
+    const environment = await screen.findByRole("combobox", { name: "Environment" });
+    await user.selectOptions(environment, "production");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText(message)).toHaveAttribute("role", "alert");
+    expect(environment).toHaveValue("production");
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("shows a permission error when the server refuses the update (403)", async () => {
+    // e.g. the user's role was lowered after this page loaded.
+    mockAuth(analystUser);
+    server.use(
+      http.get("/assets/:id", () => HttpResponse.json(contextAsset)),
+      http.patch("/assets/:id", () =>
+        HttpResponse.json({ detail: "Requires one of roles: admin, analyst" }, { status: 403 }),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderDetail();
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Criticality" }), "low");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("You don't have permission to do that.")).toHaveAttribute("role", "alert");
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("does not carry an unsaved selection over when the graph navigates to another asset", async () => {
+    mockAuth(adminUser);
+    const neighborId = "55555555-5555-5555-5555-555555555555";
+    const neighborAsset = { ...confirmedAsset, id: neighborId, value: "neighbor-detail-marker.example.com", criticality: "low" as const };
+    const graphNode = { status: "active", confidence: 1.0, environment: null, criticality: null, owner: null, tags: [], first_seen: "2026-01-01T00:00:00Z", last_seen: "2026-01-01T00:00:00Z" };
+    let patchCalls = 0;
+    server.use(
+      http.get(`/assets/${ASSET_ID}`, () => HttpResponse.json(contextAsset)),
+      http.get(`/assets/${ASSET_ID}/graph`, () =>
+        HttpResponse.json({
+          nodes: [
+            { ...graphNode, id: ASSET_ID, asset_type: "domain", value: "example.com", source: "manual" },
+            { ...graphNode, id: neighborId, asset_type: "subdomain", value: "www.example.com", source: "discovery" },
+          ],
+          edges: [
+            {
+              id: "edge-1",
+              source_asset_id: neighborId,
+              target_asset_id: ASSET_ID,
+              relationship_type: "belongs_to",
+              status: "active",
+              confidence: 1.0,
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+          metadata: { seed_asset_id: ASSET_ID, depth: 2, node_count: 2, edge_count: 1 },
+        }),
+      ),
+      http.get(`/assets/${neighborId}`, () => HttpResponse.json(neighborAsset)),
+      http.get(`/assets/${neighborId}/risk`, () => HttpResponse.json({ ...fakeRisk, asset_id: neighborId })),
+      http.get(`/assets/${neighborId}/graph`, () => HttpResponse.json(emptyGraph)),
+      http.get(`/assets/${neighborId}/relationships`, () => HttpResponse.json([])),
+      http.get(`/assets/${neighborId}/observations`, () => HttpResponse.json([])),
+      http.patch("/assets/:id", () => {
+        patchCalls += 1;
+        return HttpResponse.json(neighborAsset);
+      }),
+    );
+    const user = userEvent.setup();
+
+    const { queryClient } = renderDetail();
+    // Already cached (e.g. visited earlier), so the page renders it
+    // straight away with no loading state in between -- the case where
+    // a draft could otherwise survive the navigation.
+    queryClient.setQueryData(["assets", "detail", neighborId], neighborAsset);
+
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Criticality" }), "critical");
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+
+    const graphImage = await screen.findByRole("img", { name: /attack surface graph/i });
+    await user.click(within(graphImage).getByRole("button", { name: /www\.example\.com/i }));
+
+    await waitFor(() => expect(screen.getByText("neighbor-detail-marker.example.com")).toBeInTheDocument());
+    expect(screen.getByRole("combobox", { name: "Criticality" })).toHaveValue("low");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(patchCalls).toBe(0);
   });
 });

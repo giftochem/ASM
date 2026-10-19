@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { useAsset } from "../hooks/useAsset";
 import { useConfirmAuthorization } from "../hooks/useConfirmAuthorization";
 import { useRevokeAuthorization } from "../hooks/useRevokeAuthorization";
+import { useUpdateAsset } from "../hooks/useUpdateAsset";
 import { useScans } from "../hooks/useScans";
 import { useAssetRisk } from "../hooks/useAssetRisk";
 import { useAssetGraph } from "../hooks/useAssetGraph";
@@ -16,12 +17,14 @@ import { AssetStatusBadge } from "../components/AssetStatusBadge";
 import { PriorityBadge } from "../components/PriorityBadge";
 import { GraphView } from "../components/GraphView";
 import { NotFoundError } from "../api/errors";
-import type { GraphNode } from "../api/assets";
+import type { Asset, AssetCriticality, AssetEnvironment, AssetUpdatePayload, GraphNode } from "../api/assets";
 
 const AUTHORIZATION_DISCLAIMER =
   "You must own this asset, or hold explicit written permission (e.g. a signed pentest/MSSP engagement) to test it. Scanning systems without authorization may violate the Computer Fraud and Abuse Act (US), the Computer Misuse Act (UK), or equivalent laws elsewhere.";
 
 const CAN_MANAGE_ROLES = new Set(["admin", "analyst"]);
+const CRITICALITY_OPTIONS: AssetCriticality[] = ["low", "medium", "high", "critical"];
+const ENVIRONMENT_OPTIONS: AssetEnvironment[] = ["production", "staging", "development", "test", "unknown"];
 const DEFAULT_GRAPH_DEPTH = 2;
 const MAX_GRAPH_DEPTH = 5;
 
@@ -31,6 +34,120 @@ function formatDateTime(value: string | null): string {
 
 function humanizeChangeType(changeType: string): string {
   return changeType.replaceAll("_", " ");
+}
+
+// Stage A.1: criticality and environment, the human-set business context
+// prioritization reads. Rendered with key={assetId}: the route keeps this
+// page mounted when the graph navigates to another asset, and an unsaved
+// selection (or a save still in flight) must never land on that asset.
+function BusinessContext({ assetId, asset, canManage }: { assetId: string; asset: Asset; canManage: boolean }) {
+  const updateAsset = useUpdateAsset(assetId);
+  // null means untouched: the control shows the stored value.
+  const [draftCriticality, setDraftCriticality] = useState<AssetCriticality | "" | null>(null);
+  const [draftEnvironment, setDraftEnvironment] = useState<AssetEnvironment | "" | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  // "" is the "Not set" option. Only the fields that differ from what's
+  // stored are sent; one sent as null clears the stored value.
+  const criticality = draftCriticality ?? asset.criticality ?? "";
+  const environment = draftEnvironment ?? asset.environment ?? "";
+  const changes: AssetUpdatePayload = {};
+  if (criticality !== (asset.criticality ?? "")) {
+    changes.criticality = criticality || null;
+  }
+  if (environment !== (asset.environment ?? "")) {
+    changes.environment = environment || null;
+  }
+  const hasChanges = Object.keys(changes).length > 0;
+
+  const handleSave = async () => {
+    setSaved(false);
+    try {
+      await updateAsset.mutateAsync(changes);
+      setDraftCriticality(null);
+      setDraftEnvironment(null);
+      setSaved(true);
+    } catch {
+      // surfaced via updateAsset.error below
+    }
+  };
+
+  return (
+    <div className="mt-4 border-t pt-3">
+      <h3 className="mb-2 text-sm font-semibold">Business context</h3>
+      <dl className="grid grid-cols-2 gap-y-2 text-sm">
+        <dt className="text-slate-500">Criticality</dt>
+        <dd>
+          {canManage ? (
+            <select
+              aria-label="Criticality"
+              className="rounded border px-2 py-1 text-sm disabled:opacity-50"
+              value={criticality}
+              disabled={updateAsset.isPending}
+              onChange={(event) => {
+                setDraftCriticality(event.target.value as AssetCriticality | "");
+                setSaved(false);
+              }}
+            >
+              <option value="">Not set</option>
+              {CRITICALITY_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          ) : (
+            asset.criticality ?? "—"
+          )}
+        </dd>
+        <dt className="text-slate-500">Environment</dt>
+        <dd>
+          {canManage ? (
+            <select
+              aria-label="Environment"
+              className="rounded border px-2 py-1 text-sm disabled:opacity-50"
+              value={environment}
+              disabled={updateAsset.isPending}
+              onChange={(event) => {
+                setDraftEnvironment(event.target.value as AssetEnvironment | "");
+                setSaved(false);
+              }}
+            >
+              <option value="">Not set</option>
+              {ENVIRONMENT_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          ) : (
+            asset.environment ?? "—"
+          )}
+        </dd>
+      </dl>
+      {canManage ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={!hasChanges || updateAsset.isPending}
+            className="rounded bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+          >
+            {updateAsset.isPending ? "Saving..." : "Save"}
+          </button>
+          {/* Always mounted so screen readers announce the text when it appears. */}
+          <span role="status" className="text-sm text-green-700">
+            {saved ? "Business context saved." : ""}
+          </span>
+        </div>
+      ) : null}
+      {updateAsset.error ? (
+        <div className="mt-2">
+          <ApiErrorAlert error={updateAsset.error} />
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function AssetDetailPage() {
@@ -135,10 +252,6 @@ export function AssetDetailPage() {
                 {asset.authorization_confirmed ? "Authorized" : "Unauthorized"}
               </span>
             </dd>
-            <dt className="text-slate-500">Environment</dt>
-            <dd>{asset.environment ?? "—"}</dd>
-            <dt className="text-slate-500">Criticality</dt>
-            <dd>{asset.criticality ?? "—"}</dd>
             <dt className="text-slate-500">Owner</dt>
             <dd>{asset.owner ?? "—"}</dd>
             <dt className="text-slate-500">Tags</dt>
@@ -181,6 +294,8 @@ export function AssetDetailPage() {
               <ApiErrorAlert error={revokeAuthorization.error} />
             </div>
           ) : null}
+
+          <BusinessContext key={assetId} assetId={assetId ?? ""} asset={asset} canManage={canManage} />
         </section>
 
         {/* --- Priority --- */}

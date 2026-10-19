@@ -333,9 +333,11 @@ def _classify_observation(
 
     # ChangeType.asset_updated is intentionally not classified into an
     # alert here -- see AlertType's own docstring (app/core/enums.py)
-    # for why: it is currently unreachable (_refresh_asset's own diff
+    # for why: discovery never produces one (_refresh_asset's own diff
     # can only ever detect a status transition, already the dedicated
-    # important_asset_reappeared type above).
+    # important_asset_reappeared type above), and the one source that
+    # does -- Stage A.1's manual criticality/environment edit -- is the
+    # organization's own audited classification, not an alertable change.
 
     if change_type == ChangeType.certificate_changed:
         priority = _combine_priority(_TYPE_BASELINE_PRIORITY[AlertType.certificate_changed], _looked_up_priority(priority_lookup, asset))
