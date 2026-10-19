@@ -1400,6 +1400,44 @@ model, table, migration or dependency.
   refreshes the asset's priority, change history and graph, plus the
   asset lists, prioritized list, activity feed and summary.
 
+**Exposure evidence and relationship semantics (Stage A.2)** — the
+foundation the attack-path engine will build on. Two read-only service
+modules, no API route, no UI, no migration, no network access.
+
+- **`exposure_evidence_service`** decides whether an asset is an
+  *observed* entry point. Only attributable service observations count:
+  an HTTP response from the `http` provider, a completed TLS handshake
+  from the `certificate` provider or an ssl scan, or an open port from a
+  completed port scan. DNS records, certificate-transparency names, a
+  certificate record on its own, and asset type never count, and
+  neither does anything from a test-only or unknown provider. Any HTTP
+  status, 403/404/500 included, means the endpoint responded. Each later
+  attempt is confirmed, negative or inconclusive: the only stored
+  definitive negative is a port scan's `closed` state; HTTP,
+  certificate-run and scan-module failures are kept only as free text
+  (a DNS failure, timeout and refused connection look the same), so
+  they, `filtered` ports and out-of-scope redirects are inconclusive --
+  reported on the evidence, never invalidating it. Each piece of evidence
+  carries its source, record ids, first/last confirmation times and a
+  freshness of `current` (confirmed within 7 days, no negative since),
+  `stale`, `superseded` (a negative at or after the last confirmation;
+  a tie goes against it) or `unknown` (no confirmation time recorded);
+  only `current` qualifies, and it means "recently observed", never
+  "available now".
+- **`relationship_traversal_rules`** decides which relationships a path
+  may follow, with a reason for every decision: `resolves_to` forward
+  from a domain/subdomain, only when discovery created it and a
+  completed `dns` run in the organization recorded exactly that
+  resolution (a manually entered `resolves_to` is an analyst assertion,
+  not an observed DNS fact, and v0.1 never follows it); `hosts`/`exposes`
+  forward only when an analyst entered them and the creation is in the
+  audit log. Everything
+  else (`related_to`, `announced_by`, `served_by`, `uses`, `belongs_to`,
+  `owns`, `deployed_on`, `interacts_with`) is never followed, and
+  reverse, stale/disappeared and cross-organization relationships are
+  always rejected. Shared IPs, certificates, ASNs and name servers are
+  never treated as paths.
+
 ### SSRF hardening
 
 `app/scanners/net_safety.py` resolves a target hostname (all A/AAAA
