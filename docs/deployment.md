@@ -30,6 +30,13 @@ integration — those are separate, not-yet-scoped work.
 - `nginx` sits on `asm_net` at a pinned address (`172.28.0.10`), which
   `app`'s `TRUSTED_PROXY_IPS_RAW` names deterministically (hardcoded in
   this file — see the comment on `app`'s `environment:` block).
+- `nginx` publishes ports 80/443 on `127.0.0.1` only: by default the
+  stack is reachable from this machine and nothing else. See
+  [Exposing it beyond this machine](#exposing-it-beyond-this-machine).
+- There is no `beat` service, so discovery schedules are never dispatched
+  automatically in this configuration (a manual "Run now" is still
+  executed by `worker`). Scheduled monitoring needs `beat`, which only
+  `docker-compose.yml` runs today.
 
 ## One-time setup
 
@@ -47,8 +54,8 @@ integration — those are separate, not-yet-scoped work.
    ```
    docker\nginx\generate-self-signed-cert.ps1
    ```
-   Self-signed, `CN=localhost`, valid 365 days — browsers will show a
-   trust warning, which is expected until a real domain exists. Output
+   Self-signed, `CN=localhost`, valid 365 days — for local testing only.
+   Browsers will show a trust warning, which is expected. Output
    goes to `docker/nginx/certs/` (gitignored — same rule as `.env`: a
    private key, even a throwaway one, is never committed). When a real
    domain and CA-issued cert (Let's Encrypt/ACME or otherwise) exist,
@@ -66,17 +73,27 @@ integration — those are separate, not-yet-scoped work.
    service.
 
 4. **Also nothing to do here** — `docker-compose.prod.yml` hardcodes
-   `ENVIRONMENT: production`, same reasoning as step 3: it's
-   unconditionally correct for this file, and putting it in the shared
-   `.env` instead would flip the *dev* stack's cookies to `Secure` too
-   (`app/config.py`'s `cookie_secure`), which plain-HTTP dev traffic
-   can't carry — browsers silently drop them.
+   `ENVIRONMENT: production` on both `app` and `worker` (the worker's
+   test-only discovery provider gate depends on it), same reasoning as
+   step 3: it's unconditionally correct for this file, and putting it in
+   the shared `.env` instead would flip the *dev* stack's cookies to
+   `Secure` too (`app/config.py`'s `cookie_secure`), which plain-HTTP dev
+   traffic can't carry — browsers silently drop them.
 
-5. **Set `ALLOWED_ORIGINS` in `.env`** to the real origin you'll serve
-   this on (e.g. `https://your-domain.example`). Same-origin requests
-   (frontend and API both behind the same `nginx`) don't strictly need
-   CORS to succeed, but the value should still reflect reality rather
-   than the dev default (`http://localhost:3000`).
+5. **Give production its own `.env` — never the development one.** Both
+   compose files read `./.env` from the directory they're run in, so
+   starting this file from your development checkout reuses the dev
+   `JWT_SECRET_KEY` and database password. Run production from a
+   separate checkout or export of the release commit (e.g.
+   `git archive <commit> | tar -x -C ../asm-release`), do steps 1–2 and
+   everything below from that directory, and create its `.env` from
+   `.env.example` with new values for `JWT_SECRET_KEY`,
+   `POSTGRES_PASSWORD` (and the matching `DATABASE_URL`), plus
+   `ALLOWED_ORIGINS` set to the origin you serve (`https://localhost`
+   for the default loopback setup). The database password is fixed when
+   a volume is first initialized: changing `POSTGRES_PASSWORD` later
+   doesn't change it, and reusing a project name (`-p asm-prod`) reuses
+   that project's existing volume.
 
 ## Running it
 
@@ -96,6 +113,35 @@ verification again.
 First run against a fresh volume also needs migrations:
 ```
 docker exec asm-prod-app-1 alembic -c alembic.ini upgrade head
+```
+
+The app is then at `https://localhost`, on this machine only.
+
+## Exposing it beyond this machine
+
+Not recommended for this beta. Before publishing it on any network:
+
+- **Self-registration is open.** Anyone who can reach the instance can
+  create an organization and its admin account, attest authorization for
+  targets of their choosing, and run discovery from this host. Keep it
+  to trusted networks; it is not safe to expose to the internet.
+- Replace the self-signed certificate with one for the real hostname
+  (step 2), and consider the `/docs` gap below.
+- On Docker Desktop for Windows, Windows Firewall commonly has an allow
+  rule for Docker's backend covering every port, including on Public
+  networks, so anything published on all interfaces is reachable from
+  the network — the loopback binding is what keeps the default setup
+  local.
+
+Then publish nginx on all interfaces with an extra, uncommitted Compose
+file passed as a second `-f` (`!override` replaces the port list rather
+than appending to it):
+```yaml
+services:
+  nginx:
+    ports: !override
+      - "80:80"
+      - "443:443"
 ```
 
 ## Known gaps, deliberately out of scope for this pass

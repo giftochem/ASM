@@ -51,8 +51,12 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+    # Loopback only (Stage D.2B): a bare "8000:8000" binds every host
+    # interface, which put the dev API -- plain HTTP, non-Secure cookies,
+    # open self-registration -- on the LAN. The Vite dev server proxies to
+    # http://localhost:8000 from this same machine, so it is unaffected.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy

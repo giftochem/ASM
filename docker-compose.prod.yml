@@ -92,6 +92,11 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      # Pinned here for the same reason as on `app` (Stage D.2B): the
+      # worker executes discovery runs, and the test-only provider gate
+      # (app/discovery/registry.py) trusts ENVIRONMENT. A literal in
+      # `environment:` overrides whatever the shared .env says.
+      ENVIRONMENT: production
     depends_on:
       db:
         condition: service_healthy
@@ -106,9 +111,14 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    # Loopback only by default (Stage D.2B): the beta is meant to run on
+    # the machine it's installed on. Serving other machines is a
+    # deliberate step -- see "Exposing it beyond this machine" in
+    # docs/deployment.md (self-registration is open; the cert is a
+    # self-signed placeholder).
     ports:
-      - "80:80"
-      - "443:443"
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./docker/nginx/certs:/etc/nginx/certs:ro

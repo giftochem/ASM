@@ -1613,7 +1613,7 @@ opted in an unreachable stack is a hard failure, not a skip. See
   `analyst` / `viewer`) — see [`docs/auth-cookie-model.md`](docs/auth-cookie-model.md)
 - **Containerization**: Docker + Docker Compose — dev (`docker-compose.yml`:
   `app`, `worker`, `beat`, `db`, `redis`) and production
-  (`docker-compose.prod.yml`: adds `nginx` for TLS; see
+  (`docker-compose.prod.yml`: adds `nginx` for TLS, has no `beat`; see
   [`docs/deployment.md`](docs/deployment.md))
 - **Testing**: pytest, against a real Postgres database (not SQLite/mocks);
   mocked HTTP transports (`httpx.MockTransport`) for scanner-module tests
@@ -1660,6 +1660,11 @@ docker\nginx\generate-self-signed-cert.ps1
 docker compose -p asm-prod -f docker-compose.prod.yml up -d --build
 docker exec asm-prod-app-1 alembic -c alembic.ini upgrade head   # first run only
 ```
+It serves `https://localhost` to this machine only. Run it from a
+separate checkout with its own `.env` (never the development secrets),
+and read the deployment guide before exposing it to any network:
+self-registration is open and the certificate is a local-testing
+placeholder.
 
 ### Authentication (cookie-based — see docs/auth-cookie-model.md)
 
@@ -1718,7 +1723,9 @@ curl -X POST http://localhost:8000/scans -b cookies.txt -c cookies.txt \
 
 Requires `worker` **and** `beat` both running (`docker compose up -d
 worker beat`) — `beat` dispatches due schedules every 60s, `worker`
-executes them.
+executes them. Only the development compose file runs `beat`:
+`docker-compose.prod.yml` has none, so schedules are never dispatched
+automatically there.
 
 ```bash
 # 1. Create + authorize a seed asset (same as scanning — see above)
