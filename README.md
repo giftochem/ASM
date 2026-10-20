@@ -753,8 +753,10 @@ on demand from existing columns and indexes.
   visualization, no alerting/notifications/remediation, no cached or
   materialized graph table, no graph database, no new discovery
   provider, no relationship-level observation history, **no Web3
-  functionality of any kind** — all of these remain explicitly future
-  roadmap work, not silently deferred without saying so.
+  functionality of any kind** — all of these were explicitly left as
+  future roadmap work, not silently deferred without saying so (several
+  have since shipped, including Stage A.1's audited criticality and
+  environment updates via `PATCH /assets/{asset_id}`).
 
 **Change Intelligence & Attack-Surface Monitoring Foundation (Step 9.9)**
 — makes discovery's existing history genuinely trustworthy for change
@@ -1124,10 +1126,16 @@ also clears an explicit bar.
   `discovery_normalization_service._refresh_asset` only ever mutates
   `last_seen`/`confidence`/`status` on an existing asset, so its own
   before/after diff can never actually detect a `value`/`asset_type`/
-  `source`/`environment`/`criticality`/`owner`/`tags` change (there is
-  still no write endpoint for those fields at all — the same disclosed
-  gap since Step 8.1/9.5) — only a status transition, which is already
-  the dedicated `important_asset_reappeared` type. Shipping a type with
+  `source`/`environment`/`criticality`/`owner`/`tags` change — only a
+  status transition, which is already the dedicated
+  `important_asset_reappeared` type. (None of those fields had a write
+  endpoint when this step shipped. Stage A.1 later added
+  `PATCH /assets/{asset_id}`: admins and analysts can update
+  `criticality` and `environment` only — every change is audited, and no
+  other asset field can be modified through it. Those edits are the
+  organization's own audited classification, deliberately not an alert
+  type; `value`/`asset_type`/`source`/`owner`/`tags` still have no write
+  endpoint.) Shipping a type with
   no reachable trigger would have violated this taxonomy's own "only
   types backed by actual existing intelligence" rule, so it was cut
   rather than kept as dead code — found and fixed during this step's
