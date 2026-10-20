@@ -34,20 +34,34 @@ This is a **two-layer** guardrail, not just a create-time check:
 Neither check can be bypassed through the API. The confirming/revoking
 user and timestamp are recorded on the asset and in the audit log.
 
-## Status: foundation complete, pending release-readiness signoff
+## Status: local self-hosted beta (release candidate)
 
-Backend, frontend, authentication/credential-security remediation, and
-production deployment posture (nginx/TLS, hardened Docker Compose) are
-all built and tested. A release-readiness audit (Step 7C) has run once
-against a genuinely fresh clone and returned **PASS WITH FINDINGS**; this
-README update is part of closing those findings out before the
-`v0.1.0-security-foundation` tag. See "Release readiness (Step 7C)"
-below for what that audit actually checks and its current state.
+ASM is a beta you run yourself, on your own machine, with Docker Compose.
+It is not a hosted SaaS, and there is no public deployment.
 
-Once tagged, subsequent work (Step 8 onward — Asset Intelligence,
-Passive/Active Discovery, Risk Engine, Continuous Monitoring, etc.) is
-scoped against a single product-capability statement, not a feature
-count:
+- **Development** (`docker-compose.yml`) runs `app`, `worker`, `beat`,
+  `db` and `redis`; the API is published on `127.0.0.1:8000` only.
+- **Production mode** (`docker-compose.prod.yml`) adds `nginx` for TLS,
+  published on `127.0.0.1` only, and runs **no `beat`** — see
+  [`docs/deployment.md`](docs/deployment.md).
+- **Discovery runs when you start it** (`POST /discovery/runs`, or a
+  schedule's "Run now", which `worker` executes). **Scheduled discovery
+  runs on its own only while a Celery `beat` scheduler is running**: the
+  development Compose file runs one, the production Compose file does not.
+- **TLS** in production mode uses a self-signed certificate for local
+  testing only — browsers will warn; it is not publicly trusted.
+- **Self-registration is open**: anyone who can reach an instance can
+  create an organization. Keep it on localhost or a trusted network; it
+  is not hardened for internet exposure.
+- **Exposure paths** are observed exposure paths, not verified exploit
+  chains. Web3 discovery and smart-contract analysis are not implemented.
+
+The security foundation (Steps 1-7) went through a release-readiness
+audit (Step 7C) against a fresh clone — see "Release readiness (Step 7C)"
+below for what it checks. Work since then (Step 8 onward — Asset
+Intelligence, Passive/Active Discovery, Risk Engine, Continuous
+Monitoring, etc.) is scoped against a single product-capability
+statement, not a feature count:
 
 > Given an authorized organization, ASM can discover its externally
 > visible attack surface, continuously determine what changed, identify
@@ -956,7 +970,10 @@ exploitable.**
 
 **Continuous Monitoring & Discovery Orchestration (Step 9.11)** — makes
 discovery operationally usable as a recurring, unattended process
-instead of something only ever triggered manually. **This is not an
+instead of something only ever triggered manually. The unattended part
+needs a running Celery `beat` scheduler: `docker-compose.yml` runs one,
+`docker-compose.prod.yml` does not, so there schedules run only when
+triggered with "Run now". **This is not an
 intelligence provider** (no new signal is discovered) and **not a
 general-purpose scheduler** — it is a deliberately boring, narrow
 orchestration layer over the exact `discovery_service.create_run`/
@@ -1951,7 +1968,7 @@ asm/
 
 ## Roadmap: Step 8 onward
 
-With the foundation (Steps 1-7) tagged, subsequent work follows this
+With the foundation (Steps 1-7) complete, subsequent work follows this
 sequence — not reordered, each gated on the prior step actually being
 closed:
 

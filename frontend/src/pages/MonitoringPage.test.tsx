@@ -92,6 +92,17 @@ describe("MonitoringPage", () => {
     expect(within(row).getByText("Enabled")).toBeInTheDocument();
   });
 
+  it("says scheduled re-checks need the beat scheduler, without promising automatic runs", async () => {
+    mockAuth(adminUser);
+    mockBaseline([]);
+    renderWithProviders(<MonitoringPage />);
+
+    const intro = screen.getByText(/recurring discovery/i);
+    expect(intro).toHaveTextContent(/only while the Celery beat scheduler is running/i);
+    expect(intro).toHaveTextContent(/production Compose file doesn't run it/i);
+    expect(intro).not.toHaveTextContent(/re-checked automatically/i);
+  });
+
   it("shows an empty state and an error state without crashing", async () => {
     mockAuth(adminUser);
     mockBaseline([]);

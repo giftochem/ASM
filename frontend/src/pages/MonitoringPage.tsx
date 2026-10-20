@@ -222,7 +222,8 @@ export function MonitoringPage() {
     <div>
       <h1 className="mb-1 text-xl font-semibold text-slate-900">Continuous Monitoring</h1>
       <p className="mb-4 text-sm text-slate-500">
-        Recurring discovery -- your attack surface is re-checked automatically on the interval you set.
+        Recurring discovery -- schedules re-check your attack surface on the interval you set, but only while the
+        Celery beat scheduler is running (the production Compose file doesn't run it). "Run now" works either way.
       </p>
 
       {canManage ? (
