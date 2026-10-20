@@ -98,14 +98,14 @@ TanStack Query, graph visualization via `d3-force` (Step 9.13, the
 project's one chart/graph dependency). Every authenticated page renders
 inside a persistent `AppShell` nav (Step 9.13). Pages: Overview, Attack
 Surface (Explorer) / Asset Detail (+priority/graph/relationships/
-changes), Change Timeline, Alerts, Prioritized Assets, Continuous
-Monitoring, Scans / Scan Detail, Findings, Reports, Settings, Login /
-Register, plus `RequireAuth`/`RequireRole` route guards and a global
-`ErrorBoundary`. Talks to the backend exclusively via cookie auth (no
-tokens ever touch `localStorage` or JS-readable state) — see
-`docs/auth-cookie-model.md`. 47 test files / 285 tests
-(`@testing-library/react` + MSW for API mocking), typechecked with
-`tsc --noEmit`, built with `vite build`.
+changes), Change Timeline, Alerts, Prioritized Assets, Exposure Paths,
+Continuous Monitoring, Scans / Scan Detail, Findings, Reports, Settings,
+Login / Register, plus `RequireAuth`/`RequireRole` route guards and a
+global `ErrorBoundary`. Talks to the backend exclusively via cookie auth
+(no tokens ever touch `localStorage` or JS-readable state) — see
+`docs/auth-cookie-model.md`. Tested with `@testing-library/react` + MSW
+for API mocking (last verified counts: "Latest full test run" below),
+typechecked with `tsc --noEmit`, built with `vite build`.
 
 **Auth / credential-security remediation (Step 7A)** — driven by a
 dedicated read-only security audit that found one Critical issue (a
@@ -1112,7 +1112,7 @@ Observation in the first place (Step 9.9's dedup already ensures
 that); this step's own job is deciding which of those genuine changes
 also clears an explicit bar.
 
-- **A small, fixed taxonomy — 10 types, each backed by a real,
+- **A small, fixed taxonomy — 9 types, each backed by a real,
   already-existing signal**: `new_externally_exposed_asset`,
   `important_asset_disappeared`, `important_asset_reappeared`,
   `certificate_changed`, `dns_infrastructure_changed`,
@@ -1283,11 +1283,15 @@ also clears an explicit bar.
   captured in the activity feed and prioritization but does not itself
   raise a dedicated alert (only `infrastructure_classification_changed`
   does) — a deliberate, narrower scope than "every network_changed
-  Observation," to avoid an 11th type with weaker signal.
+  Observation," to avoid a 10th type with weaker signal.
 
 **Customer-Facing Intelligence Dashboard (Step 9.13)** — productization:
-ASM is now usable entirely through the UI, without a developer manually
-calling API endpoints. **No new backend intelligence, no second
+day-to-day work is now available in the UI, with one exception:
+discovery. A one-off discovery run is API-only (`POST /discovery/runs`);
+the UI's "Run now" triggers a saved, enabled schedule; and automatic
+recurring runs need a running Celery `beat`, which only
+`docker-compose.yml` includes (`docker-compose.prod.yml` does not).
+**No new backend intelligence, no second
 change-detection/graph/risk system** — every page is a thin
 presentation layer over the eight prior discovery/graph/prioritization/
 alerting steps' existing, already-tested endpoints.
@@ -1412,14 +1416,16 @@ model, table, migration or dependency.
 - **Priority follows on the next read**: `GET /assets/{id}/risk` and
   `GET /assets/prioritized` compute from the stored values on demand, so
   there is no second scoring path or cache to update.
-- **UI**: the Asset Detail page's Identity section shows both values;
+- **UI**: the Asset Detail page's Business context section (within
+  Identity) shows both values;
   admins and analysts get selects and Save, viewers read only. A save
   refreshes the asset's priority, change history and graph, plus the
   asset lists, prioritized list, activity feed and summary.
 
 **Exposure evidence and relationship semantics (Stage A.2)** — the
-foundation the attack-path engine will build on. Two read-only service
-modules, no API route, no UI, no migration, no network access.
+foundation the Exposure Path Engine (Stage B) is built on. Two read-only
+service modules with no API route or UI of their own, no migration, no
+network access.
 
 - **`exposure_evidence_service`** decides whether an asset is an
   *observed* entry point. Only attributable service observations count:
@@ -1446,7 +1452,7 @@ modules, no API route, no UI, no migration, no network access.
   from a domain/subdomain, only when discovery created it and a
   completed `dns` run in the organization recorded exactly that
   resolution (a manually entered `resolves_to` is an analyst assertion,
-  not an observed DNS fact, and v0.1 never follows it); `hosts`/`exposes`
+  not an observed DNS fact, and the engine never follows it); `hosts`/`exposes`
   forward only when an analyst entered them and the creation is in the
   audit log. Everything
   else (`related_to`, `announced_by`, `served_by`, `uses`, `belongs_to`,
@@ -1903,8 +1909,8 @@ npm run typecheck  # tsc --noEmit
 npm run build      # production build
 ```
 
-See "Latest full test run" at the end of this README for the current
-pass/fail counts.
+See "Latest full test run" at the end of this README for the last
+verified pass/fail counts.
 
 ## Project layout
 
@@ -2256,16 +2262,23 @@ accuracy, and a dependency/security scan.
 
 ## Latest full test run
 
+These are the counts from the last verified local runs — a record, not
+an automated guarantee (CI runs secret scanning only). Re-run the suites
+before relying on them.
+
 ```
-docker compose run --rm app pytest
-================= 930 passed, 1 skipped, 0 failed =================
+docker compose run --rm app pytest        # last full run: commit e85bc10
+================= 1139 passed, 1 skipped, 0 failed =================
 
-cd frontend && npx vitest run
-================= 48 test files, 294 tests passed =================
+cd frontend && npx vitest run             # last full run: commit 5d6848b
+================= 51 test files, 424 tests passed =================
 
-cd frontend && npm run build
+cd frontend && npm run build              # last run: commit 5d6848b
 ================= tsc --noEmit && vite build -- succeeds =================
 ```
+
+Backend code is unchanged since `e85bc10` apart from the API version
+string.
 
 The one skip is the opt-in live-stack test (`tests/test_celery_integration.py`,
 see "Running tests"); with `ASM_RUN_LIVE_STACK_TESTS=1` it runs too. The
@@ -2282,4 +2295,5 @@ Frontend count grew from 230 (39 files) to 285 (47 files) in Step 9.13 —
 `routes` composition), plus updates to every existing test whose fixture
 shape changed when `types/api.generated.ts` was regenerated against the
 now much larger live OpenAPI schema. Stage A.1 added 9 more (285 to 294,
-one new file, `hooks/useUpdateAsset.test.tsx`).
+one new file, `hooks/useUpdateAsset.test.tsx`), and Stages A.2–D.2C
+brought both suites to the counts above.

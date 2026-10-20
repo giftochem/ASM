@@ -40,7 +40,7 @@ pattern). See docs/auth-cookie-model.md for the full model.
 app = FastAPI(
     title="Attack Surface Mapper API",
     description=API_DESCRIPTION,
-    version="0.1.0",
+    version="0.9.0-beta",
 )
 
 app.state.limiter = limiter
