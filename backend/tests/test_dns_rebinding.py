@@ -53,7 +53,7 @@ def test_connection_always_targets_the_validated_ip_not_a_rebound_one(monkeypatc
     # tried (see http_client._candidate_urls) -- keeps this test focused
     # on the one thing it's proving, rather than also exercising the
     # separate https-then-http fallback behavior.
-    result = http_client.fetch(f"https://{_TARGET_HOST}/")
+    result = http_client.fetch(f"https://{_TARGET_HOST}/", scope=http_client.RequestScope.for_target(_TARGET_HOST))
 
     assert isinstance(result, http_client.FetchError)
     assert getaddrinfo_calls["n"] == 1, (

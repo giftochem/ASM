@@ -191,7 +191,7 @@ def test_cgnat_asset_creation_is_rejected_through_the_api(client, register_user)
 
 
 def _http_fetch_url(host):
-    return http_client.fetch_url(f"https://{host}/").reason
+    return http_client.fetch_url(f"https://{host}/", scope=http_client.RequestScope.for_target(host)).reason
 
 
 def _http_discovery(host):
@@ -284,7 +284,7 @@ def test_ssl_scan_dials_a_validated_public_ipv6_address(monkeypatch, dials):
 def test_http_fetch_dials_a_validated_public_ipv6_address(monkeypatch, dials):
     _fake_dns(monkeypatch, {"v6.example": ["2606:4700:4700::1111"]})
 
-    result = http_client.fetch_url("https://v6.example/")
+    result = http_client.fetch_url("https://v6.example/", scope=http_client.RequestScope.for_target("v6.example"))
 
     assert isinstance(result, http_client.FetchError)  # refused by the dial double, after validation
     assert dials == [("2606:4700:4700::1111", 443)]

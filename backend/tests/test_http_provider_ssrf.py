@@ -48,8 +48,8 @@ def _patch_with_real_pipeline_mocked_transport(monkeypatch, responses: dict[str,
     """
     transport = httpx.MockTransport(_handler(responses))
 
-    def _fake(url, _transport=None):
-        return real_fetch_url(url, _transport=transport)
+    def _fake(url, _transport=None, *, scope):
+        return real_fetch_url(url, _transport=transport, scope=scope)
 
     monkeypatch.setattr(http_provider_module.http_client, "fetch_url", _fake)
 
@@ -78,8 +78,13 @@ def test_redirect_to_private_or_loopback_target_is_rejected_via_real_pipeline(mo
     assert result.error is None
     assert len(result.http_observations) == 1
     obs = result.http_observations[0]
-    assert obs.succeeded is False
-    assert "blocked" in obs.failure_reason
+    # An IP seed's scope is that one address, so these destinations are
+    # stopped by the scope check -- before they're even resolved -- and the
+    # mocked transport (which fails on any unexpected request) proves none
+    # was contacted. In-scope names resolving to blocked addresses are
+    # covered in test_http_redirect_scope.py.
+    assert obs.left_authorized_scope is True
+    assert obs.status_code is None and obs.title is None and obs.server is None
 
 
 def test_redirect_within_scope_is_allowed_via_real_pipeline(monkeypatch):

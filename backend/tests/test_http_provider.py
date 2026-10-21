@@ -31,7 +31,7 @@ def _patch_fetch(monkeypatch, mapping: dict):
     or an Exception instance to raise.
     """
 
-    def _fake(url, _transport=None):
+    def _fake(url, _transport=None, *, scope):
         outcome = mapping[url]
         if isinstance(outcome, Exception):
             raise outcome
@@ -70,7 +70,7 @@ def test_bare_host_seed_attempts_both_schemes_independently(monkeypatch):
 def test_url_seed_attempts_only_its_own_scheme_not_broadened(monkeypatch):
     calls = []
 
-    def _fake(url, _transport=None):
+    def _fake(url, _transport=None, *, scope):
         calls.append(url)
         return _result(final_url=url, status_code=200)
 
@@ -358,7 +358,7 @@ def test_unexpected_exception_in_one_scheme_does_not_abort_the_other(monkeypatch
     def _ok(url, _transport=None):
         return _result(final_url=url, status_code=200)
 
-    def _fake(url, _transport=None):
+    def _fake(url, _transport=None, *, scope):
         if url.startswith("https://"):
             return _raise(url)
         return _ok(url)

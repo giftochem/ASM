@@ -401,18 +401,17 @@ permanent guarantee of availability.**
   is used exactly as given, one attempt, its own scheme only — never
   broadened into the other scheme or a different host.
 - **Redirect scope is checked on top of SSRF safety, not instead of
-  it.** `http_client.fetch_url`'s existing redirect loop already
-  refuses any private/loopback/link-local/reserved hop — that's
-  unconditional and unchanged. This provider adds one more check the
-  shared fetch layer deliberately doesn't have (and shouldn't, for its
-  existing active-scan callers): the *final* response URL's hostname
-  must still be in the seed's authorized scope
-  (`app.core.validation.is_hostname_in_scope`). `example.com`
-  redirecting to `www.example.com` is followed and fully recorded;
-  redirecting to `attacker-controlled.example` is recorded as the fact
-  of an out-of-scope redirect only — its headers/title/technology are
-  never attributed to the org. Only the final hop is scope-checked (a
-  documented limitation, not every intermediate one).
+  it.** `http_client.fetch_url`'s redirect loop refuses any private/
+  loopback/link-local/reserved hop — unconditional and unchanged. Every
+  fetch also carries the seed's authorized scope
+  (`app.core.validation.is_hostname_in_scope`), and the initial URL and
+  every redirect hop are checked against it *before* that hop is
+  resolved or contacted. `example.com` redirecting to `www.example.com`
+  is followed and fully recorded; redirecting to
+  `attacker-controlled.example` is not followed at all — the fetch stops
+  there, that host is never resolved, connected to or requested, and the
+  observation records only the fact of the out-of-scope redirect. A
+  chain can't pass through an out-of-scope host and come back.
 - **What's collected, per scheme**: requested/final URL, status code,
   content type, redirect count, `Server`/`X-Powered-By` headers, page
   title (HTML only), the same six security-relevant headers
@@ -1540,9 +1539,14 @@ being followed; responses are streamed with a hard byte cap regardless of
 declared `Content-Length`; only a small allowed port set is permitted.
 `app/discovery/http_provider.py` (Step 9.5) is a new consumer of this
 same layer, not a second implementation of it — it calls the now-public
-`fetch_url()` directly and adds only an authorization-*scope* check
-(distinct from SSRF safety) on top, since discovery's redirect-following
-concerns differ from an already-authorized active scan's.
+`fetch_url()` directly. Authorization scope (distinct from SSRF safety)
+is enforced in the shared layer itself: every `fetch_url()`/`fetch()`
+call must pass a `RequestScope` (there is no default and no
+unrestricted scope), and the initial URL and every redirect hop are
+checked against it before being resolved or contacted — the target
+hostname and its subdomains, or for an IP target that exact address.
+The HTTP discovery provider and the security-headers and technology
+scan modules all pass their target's own scope.
 
 **DNS-rebinding / TOCTOU is closed, not just disclosed.**
 `app/scanners/pinned_transport.py` forces every connection's TCP layer to
@@ -2122,12 +2126,12 @@ accuracy, and a dependency/security scan.
 - Unicode/IDNA hostnames from CT data are safely rejected, not
   converted — building real IDNA→punycode handling is a distinct,
   separate feature, not added speculatively here.
-- The `http` provider's redirect authorization-scope check only
-  inspects the *final* response URL, not every intermediate hop — a
-  chain that transits out of scope and back in would not be specially
-  flagged. Matches the spec's own one-hop example; a stricter per-hop
-  scope check is a reasonable future hardening, not built speculatively
-  here.
+- The `http` provider's redirect authorization-scope check used to
+  inspect only the *final* response URL, after the whole chain had been
+  fetched — **resolved**: scope is now enforced in `http_client` on the
+  initial URL and every redirect hop, before that hop is resolved or
+  contacted, for the `http` provider and the security-headers and
+  technology scan modules alike (`tests/test_http_redirect_scope.py`).
 - The `http` provider always uses `GET` (streamed, size-capped), never
   `HEAD` — `HEAD` can't yield a page title, and adding a
   HEAD-then-GET-fallback would exceed the "1 request per scheme"
@@ -2275,8 +2279,8 @@ an automated guarantee (CI runs secret scanning only). Re-run the suites
 before relying on them.
 
 ```
-docker compose run --rm app pytest        # last full run: commit e85bc10
-================= 1139 passed, 1 skipped, 0 failed =================
+docker compose run --rm app pytest        # last full run: 2026-10-21, redirect-scope fix
+================= 1192 passed, 1 skipped, 0 failed =================
 
 cd frontend && npx vitest run             # last full run: commit 5d6848b
 ================= 51 test files, 424 tests passed =================
@@ -2285,8 +2289,8 @@ cd frontend && npm run build              # last run: commit 5d6848b
 ================= tsc --noEmit && vite build -- succeeds =================
 ```
 
-Backend code is unchanged since `e85bc10` apart from the API version
-string.
+The backend count includes `tests/test_http_redirect_scope.py` (53
+tests), added with the redirect authorization-scope fix.
 
 The one skip is the opt-in live-stack test (`tests/test_celery_integration.py`,
 see "Running tests"); with `ASM_RUN_LIVE_STACK_TESTS=1` it runs too. The

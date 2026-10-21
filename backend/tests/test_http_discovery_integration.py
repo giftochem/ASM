@@ -24,7 +24,7 @@ def _result(**overrides) -> FetchResult:
 
 
 def _patch_fetch(monkeypatch, mapping: dict):
-    def _fake(url, _transport=None):
+    def _fake(url, _transport=None, *, scope):
         return mapping[url]
 
     monkeypatch.setattr(http_provider_module.http_client, "fetch_url", _fake)

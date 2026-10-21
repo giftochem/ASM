@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from app.config import settings
-from app.scanners.http_client import FetchError, FetchResult, fetch
+from app.scanners.http_client import FetchError, FetchResult, RequestScope, ScopeRejection, fetch
 
 _PUBLIC = "93.184.216.34"
 
@@ -33,7 +33,7 @@ def test_successful_fetch_returns_content():
             200, headers={"Server": "nginx", "X-Test": "1"}, text="<html>hello</html>"
         ),
     }
-    result = fetch(f"https://{_PUBLIC}/", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/", scope=RequestScope.for_target(f"https://{_PUBLIC}/"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchResult)
     assert result.status_code == 200
     assert result.headers["server"] == "nginx"
@@ -47,7 +47,7 @@ def test_redirect_to_public_destination_is_followed():
         ),
         f"https://{_PUBLIC}/final": httpx.Response(200, text="landed"),
     }
-    result = fetch(f"https://{_PUBLIC}/start", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/start", scope=RequestScope.for_target(f"https://{_PUBLIC}/start"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchResult)
     assert result.final_url == f"https://{_PUBLIC}/final"
     assert result.text == "landed"
@@ -69,9 +69,12 @@ def test_redirect_to_blocked_destination_is_not_followed(blocked_location):
     responses = {
         f"https://{_PUBLIC}/start": httpx.Response(302, headers={"Location": blocked_location}),
     }
-    result = fetch(f"https://{_PUBLIC}/start", _transport=httpx.MockTransport(_handler(responses)))
-    assert isinstance(result, FetchError), f"redirect to {blocked_location} should have been blocked"
-    assert "blocked" in result.reason
+    result = fetch(f"https://{_PUBLIC}/start", scope=RequestScope.for_target(f"https://{_PUBLIC}/start"), _transport=httpx.MockTransport(_handler(responses)))
+    # An IP target's scope is that one address, so every destination here
+    # is out of scope (stopped before resolution) -- or, for a non-IP
+    # spelling, blocked. Either way the mocked transport proves no request.
+    assert isinstance(result, (FetchError, ScopeRejection)), f"redirect to {blocked_location} should have been stopped"
+    assert isinstance(result, ScopeRejection) or "blocked" in result.reason
 
 
 def test_redirect_loop_is_detected():
@@ -79,7 +82,7 @@ def test_redirect_loop_is_detected():
         f"https://{_PUBLIC}/a": httpx.Response(302, headers={"Location": f"https://{_PUBLIC}/b"}),
         f"https://{_PUBLIC}/b": httpx.Response(302, headers={"Location": f"https://{_PUBLIC}/a"}),
     }
-    result = fetch(f"https://{_PUBLIC}/a", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/a", scope=RequestScope.for_target(f"https://{_PUBLIC}/a"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchError)
     assert "loop" in result.reason or "max_redirects" in result.reason
 
@@ -92,7 +95,7 @@ def test_too_many_redirects_is_rejected():
         responses[f"https://{_PUBLIC}/hop{i}"] = httpx.Response(
             302, headers={"Location": f"https://{_PUBLIC}/hop{i + 1}"}
         )
-    result = fetch(f"https://{_PUBLIC}/hop0", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/hop0", scope=RequestScope.for_target(f"https://{_PUBLIC}/hop0"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchError)
     assert "max_redirects" in result.reason
 
@@ -101,7 +104,7 @@ def test_response_larger_than_cap_is_truncated(monkeypatch):
     monkeypatch.setattr(settings, "max_response_size_bytes", 100)
     big_body = "x" * 10_000
     responses = {f"https://{_PUBLIC}/big": httpx.Response(200, text=big_body)}
-    result = fetch(f"https://{_PUBLIC}/big", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/big", scope=RequestScope.for_target(f"https://{_PUBLIC}/big"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchResult)
     assert result.truncated is True
     assert len(result.text) <= 100
@@ -109,7 +112,7 @@ def test_response_larger_than_cap_is_truncated(monkeypatch):
 
 def test_timeout_is_reported_as_error():
     responses = {f"https://{_PUBLIC}/slow": httpx.TimeoutException("simulated timeout")}
-    result = fetch(f"https://{_PUBLIC}/slow", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/slow", scope=RequestScope.for_target(f"https://{_PUBLIC}/slow"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchError)
     assert "timed out" in result.reason
 
@@ -120,12 +123,12 @@ def test_redirect_to_non_http_scheme_is_rejected():
             302, headers={"Location": "ftp://internal-ftp.example/secret"}
         ),
     }
-    result = fetch(f"https://{_PUBLIC}/start", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}/start", scope=RequestScope.for_target(f"https://{_PUBLIC}/start"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchError)
 
 
 def test_disallowed_port_is_rejected():
     responses = {f"https://{_PUBLIC}:9999/": httpx.Response(200, text="should not be reached")}
-    result = fetch(f"https://{_PUBLIC}:9999/", _transport=httpx.MockTransport(_handler(responses)))
+    result = fetch(f"https://{_PUBLIC}:9999/", scope=RequestScope.for_target(f"https://{_PUBLIC}:9999/"), _transport=httpx.MockTransport(_handler(responses)))
     assert isinstance(result, FetchError)
     assert "blocked" in result.reason

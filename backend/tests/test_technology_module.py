@@ -3,7 +3,7 @@ from app.scanners.technology_module import TechnologyModule
 
 
 def _fake_fetch(monkeypatch, result):
-    monkeypatch.setattr("app.scanners.technology_module.fetch", lambda target: result)
+    monkeypatch.setattr("app.scanners.technology_module.fetch", lambda target, *, scope: result)
 
 
 def test_detects_wordpress_via_header_and_body(monkeypatch):

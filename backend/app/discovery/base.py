@@ -84,12 +84,13 @@ class HttpObservation:
     for its own scheme. Kept as its own typed dataclass, matching
     CertificateObservation's precedent for structured provider output.
 
-    `left_authorized_scope`/`external_redirect_host` cover the case
-    where the final redirect destination is outside the seed's
-    authorized scope (app.core.validation.is_hostname_in_scope) -- when
-    True, `server`/`title`/`security_headers`/`technology_evidence`
-    are left at their defaults: that destination's data is never
-    attributed to the org. Deliberately carries no cookie *values* and
+    `left_authorized_scope`/`external_redirect_host` cover a redirect to
+    a destination outside the seed's authorized scope
+    (app.core.validation.is_hostname_in_scope) -- the fetch stops there,
+    before that destination is resolved or contacted, and `final_url` is
+    the rejected destination. When True, `server`/`title`/
+    `security_headers`/`technology_evidence` are left at their defaults:
+    nothing is attributed to the org. Deliberately carries no cookie *values* and
     no raw response body -- `cookie_security_flags` holds only
     attribute booleans (secure/httponly/samesite), never name=value.
     """

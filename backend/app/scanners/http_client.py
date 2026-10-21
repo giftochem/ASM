@@ -19,14 +19,26 @@ httpx/httpcore never get a chance to re-resolve the hostname themselves
 and possibly get a different (rebound) answer. TLS hostname verification
 is unaffected by this: see pinned_transport's module docstring for why,
 and tests/test_tls_pinning.py for proof in both directions.
+
+Authorization scope: every fetch carries a required RequestScope — the
+hosts the user authorized for this target. The initial URL and every
+redirect hop are checked against it BEFORE the destination is resolved,
+connected to or requested; an out-of-scope hop ends the fetch with a
+ScopeRejection, so an unauthorized host is never contacted (not even a
+DNS lookup), and a chain can't bounce through one. Each hop is parsed
+once by httpx, and that same parsed URL is what's scope-checked,
+resolved and requested, so no second URL parser can disagree about the
+host. There is no unrestricted scope: `scope` has no default.
 """
 
+import ipaddress
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import httpx
 
 from app.config import settings
+from app.core.validation import is_hostname_in_scope
 from app.scanners.net_safety import SafeTarget, UnsafeTarget, resolve_and_validate
 from app.scanners.pinned_transport import build_pinned_transport
 
@@ -56,20 +68,95 @@ class FetchError:
     reason: str
 
 
+def _normalize_host(host: str) -> str:
+    return host.strip().rstrip(".").lower()
+
+
+def _canonical_ip(host: str) -> str | None:
+    """The canonical form of `host` if it is a standard IP literal, else
+    None. Strict on purpose: decimal (2130706433), hex (0x7f.1) or
+    shortened (127.1) spellings are not IP literals here, so they can
+    never match an IP scope -- and are not a hostname scope's either."""
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class RequestScope:
+    """Which hosts a fetch may contact on behalf of one authorized target.
+
+    - Hostname target (domain/subdomain, or a url's host): that host and
+      its subdomains, by app.core.validation.is_hostname_in_scope -- the
+      rule discovery applies everywhere else. Compared in ASCII (IDNA)
+      form, case-insensitively, ignoring a trailing dot, so a Unicode
+      look-alike is a different host. An IP literal is never in scope.
+    - IP target: that exact address only, compared canonically; any other
+      address, any hostname and any alternate IP spelling is out of scope.
+
+    Build it with for_target(); a bare RequestScope() permits nothing.
+    """
+
+    hostname: str | None = None
+    ip: str | None = None
+
+    @classmethod
+    def for_target(cls, target: str) -> "RequestScope":
+        """The scope of an asset value: a bare host or IP, or an http(s)
+        URL. Raises ValueError when there's no usable host."""
+        if target.startswith(("http://", "https://")):
+            host = httpx.URL(target).raw_host.decode("ascii")
+        else:
+            host = target
+        host = _normalize_host(host)
+        if not host:
+            raise ValueError(f"no host in target '{target}'")
+        ip = _canonical_ip(host)
+        if ip is not None:
+            return cls(ip=ip)
+        return cls(hostname=host.encode("idna").decode("ascii"))
+
+    def permits(self, host: str) -> bool:
+        """`host` is httpx's ASCII host (URL.raw_host) for one hop."""
+        host = _normalize_host(host)
+        if not host:
+            return False
+        ip = _canonical_ip(host)
+        if self.ip is not None:
+            return ip == self.ip
+        if self.hostname is None or ip is not None:
+            return False
+        return is_hostname_in_scope(host, self.hostname)
+
+
+@dataclass
+class ScopeRejection:
+    """A hop's destination was outside the RequestScope. Returned BEFORE
+    that destination was resolved or contacted. `url` is the rejected
+    destination without credentials, query or fragment."""
+
+    url: str
+    host: str
+    redirect_count: int
+
+    @property
+    def reason(self) -> str:
+        return f"'{self.host}' is outside the target's authorized scope; it was not contacted"
+
+
+def _display_url(target: httpx.URL) -> str:
+    host = target.raw_host.decode("ascii", errors="replace")
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{target.port}" if target.port is not None else ""
+    return f"{target.scheme}://{host}{port}{target.path}"
+
+
 def _candidate_urls(target: str) -> list[str]:
     if target.startswith("http://") or target.startswith("https://"):
         return [target]
     return [f"https://{target}/", f"http://{target}/"]
-
-
-def _validate_url_target(url: str) -> SafeTarget | UnsafeTarget:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return UnsafeTarget(f"unsupported scheme '{parsed.scheme}'")
-    if not parsed.hostname:
-        return UnsafeTarget(f"no host in URL '{url}'")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    return resolve_and_validate(parsed.hostname, port)
 
 
 def _read_capped(response: httpx.Response) -> tuple[str, bool]:
@@ -90,8 +177,8 @@ def _read_capped(response: httpx.Response) -> tuple[str, bool]:
 
 
 def fetch_url(
-    url: str, _transport: httpx.BaseTransport | None = None
-) -> FetchResult | FetchError:
+    url: str, _transport: httpx.BaseTransport | None = None, *, scope: RequestScope
+) -> FetchResult | FetchError | ScopeRejection:
     """Fetches exactly one URL, as given, with no scheme fallback —
     unlike `fetch()` below, this never substitutes or tries a second
     scheme. Public (Step 9.5) so a caller that needs independent
@@ -106,6 +193,10 @@ def fetch_url(
     passes it, so httpx uses its normal real transport. Tests inject an
     httpx.MockTransport to avoid making real network calls while still
     exercising the full redirect/validation/streaming logic below.
+
+    `scope` is required: every hop -- the initial URL included -- must be
+    inside it, checked before that hop is resolved or contacted (see the
+    module docstring). An out-of-scope hop returns a ScopeRejection.
     """
     timeout = httpx.Timeout(
         connect=settings.http_connect_timeout_seconds,
@@ -118,7 +209,26 @@ def fetch_url(
     seen_urls = set()
     redirect_count = 0
     for _ in range(settings.max_redirects + 1):
-        validation = _validate_url_target(current_url)
+        # Parsed once, by the client that will send it: the host checked
+        # below is exactly the host resolved, connected to and requested.
+        try:
+            target = httpx.URL(current_url)
+            host = target.raw_host.decode("ascii")
+        except (httpx.InvalidURL, UnicodeError, ValueError) as exc:
+            return FetchError(f"blocked target: invalid URL ({exc})")
+        if target.scheme not in ("http", "https"):
+            return FetchError(f"blocked target '{_display_url(target)}': unsupported scheme '{target.scheme}'")
+        if not host:
+            return FetchError(f"blocked target '{_display_url(target)}': no host in URL")
+        # Authorization scope first: an out-of-scope destination is never
+        # resolved, connected to or requested.
+        if not scope.permits(host):
+            return ScopeRejection(url=_display_url(target), host=_normalize_host(host), redirect_count=redirect_count)
+        if target.userinfo:
+            return FetchError(f"blocked target '{_display_url(target)}': URLs carrying credentials are not followed")
+        validation: SafeTarget | UnsafeTarget = resolve_and_validate(
+            host, target.port or (443 if target.scheme == "https" else 80)
+        )
         if isinstance(validation, UnsafeTarget):
             return FetchError(f"blocked target '{current_url}': {validation.reason}")
         if current_url in seen_urls:
@@ -138,7 +248,7 @@ def fetch_url(
                 follow_redirects=False, timeout=timeout, verify=True, transport=transport
             ) as client:
                 with client.stream(
-                    "GET", current_url, headers={"User-Agent": _USER_AGENT}
+                    "GET", target, headers={"User-Agent": _USER_AGENT}
                 ) as response:
                     if response.is_redirect:
                         location = response.headers.get("location")
@@ -166,16 +276,27 @@ def fetch_url(
     return FetchError(f"exceeded max_redirects={settings.max_redirects} starting from '{url}'")
 
 
-def fetch(target: str, _transport: httpx.BaseTransport | None = None) -> FetchResult | FetchError:
+def fetch(
+    target: str, _transport: httpx.BaseTransport | None = None, *, scope: RequestScope
+) -> FetchResult | FetchError | ScopeRejection:
     """Fetches `target`, which may be a bare host (domain/subdomain/
     ip_address asset value — https tried first, http as fallback) or a
     full http(s) URL (url asset value, used as-is). `_transport` is a
-    test-only seam, see fetch_url.
+    test-only seam, see fetch_url. `scope` is required, as for fetch_url
+    (callers pass RequestScope.for_target(target)). When no candidate
+    succeeds and one was stopped for leaving scope, that ScopeRejection
+    is returned, so callers can report it as such.
     """
     errors: list[str] = []
+    rejection: ScopeRejection | None = None
     for candidate in _candidate_urls(target):
-        result = fetch_url(candidate, _transport)
+        result = fetch_url(candidate, _transport, scope=scope)
         if isinstance(result, FetchResult):
             return result
+        if isinstance(result, ScopeRejection):
+            rejection = rejection or result
+            continue
         errors.append(result.reason)
+    if rejection is not None:
+        return rejection
     return FetchError("; ".join(errors) if errors else f"no candidate URLs for '{target}'")

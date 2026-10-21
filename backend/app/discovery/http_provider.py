@@ -13,17 +13,14 @@ fallback — called independently once per scheme here, so "HTTPS
 reachable" and "HTTP reachable" are reported as two separate signals
 instead of "the first one that worked."
 
-SAFETY: fetch_url's redirect handling is SSRF-safe (no private/loopback/
-link-local destination) but has no concept of *authorization scope* —
-that's correct for its existing active-scan callers (an authorized
-target is expected to redirect wherever it wants), but wrong for
-discovery, where a redirect can land on a genuinely different,
-unauthorized entity. This module adds that scope check on top, against
-the final response URL only: if the final destination has left the
-seed's authorized scope (app.core.validation.is_hostname_in_scope), the
-observation still records the fact of the redirect, but nothing about
-that destination (headers/title/technology) is captured or attributed
-to the org.
+SAFETY: every fetch carries the seed's RequestScope (the seed host and
+its subdomains, app.core.validation.is_hostname_in_scope). fetch_url
+checks the initial URL and every redirect hop against it before that
+hop is resolved or contacted, on top of its SSRF checks. A redirect
+that leaves scope is never followed: the observation records only that
+it happened (the rejected destination's host and URL, as
+`left_authorized_scope`), and that destination is never resolved,
+contacted or attributed to the org.
 """
 
 import re
@@ -33,7 +30,7 @@ from app.core.enums import AssetType
 from app.core.validation import is_hostname_in_scope
 from app.discovery.base import DiscoveryProvider, DiscoveryProviderResult, HttpObservation
 from app.scanners import http_client
-from app.scanners.http_client import FetchError, FetchResult
+from app.scanners.http_client import FetchError, FetchResult, RequestScope, ScopeRejection
 
 _SECURITY_HEADERS = (
     "strict-transport-security",
@@ -112,13 +109,28 @@ def _parse_cookie_flags(raw_cookie: str) -> dict:
 
 def _observe_scheme(url: str, scheme: str, seed_value: str) -> HttpObservation:
     try:
-        result = http_client.fetch_url(url)
+        result = http_client.fetch_url(url, scope=RequestScope.for_target(seed_value))
     except Exception as exc:
         return HttpObservation(scheme=scheme, requested_url=url, succeeded=False, failure_reason=str(exc))
+
+    if isinstance(result, ScopeRejection):
+        # Stopped before the out-of-scope destination was resolved or
+        # contacted -- recorded exactly like any other out-of-scope
+        # redirect (a `rejected` result, never exposure evidence).
+        return HttpObservation(
+            scheme=scheme,
+            requested_url=url,
+            succeeded=True,
+            left_authorized_scope=True,
+            external_redirect_host=result.host,
+            final_url=result.url,
+            redirect_count=result.redirect_count,
+        )
 
     if isinstance(result, FetchError):
         return HttpObservation(scheme=scheme, requested_url=url, succeeded=False, failure_reason=result.reason)
 
+    # Defense in depth: fetch_url never returns an out-of-scope final URL.
     final_host = urlparse(result.final_url).hostname
     if not final_host or not is_hostname_in_scope(final_host, _seed_hostname(seed_value)):
         return HttpObservation(

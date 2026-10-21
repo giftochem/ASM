@@ -258,7 +258,7 @@ def test_http_server_header_evidence_is_correlated_from_related_hostname(client,
     from app.scanners.http_client import FetchResult
     import app.discovery.http_provider as http_provider_module
 
-    def _fake_fetch_url(url, _transport=None):
+    def _fake_fetch_url(url, _transport=None, *, scope):
         return FetchResult(
             final_url=url, status_code=200, headers={"Server": "AmazonS3"}, text="", truncated=False,
             redirect_count=0, set_cookie_headers=[],

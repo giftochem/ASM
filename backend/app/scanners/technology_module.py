@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from app.core.enums import AssetType, FindingSeverity
 from app.scanners.base import ScanFinding, ScanModuleResult, ScannerModule
-from app.scanners.http_client import FetchError, fetch
+from app.scanners.http_client import FetchError, RequestScope, ScopeRejection, fetch
 
 
 @dataclass
@@ -69,8 +69,10 @@ class TechnologyModule(ScannerModule):
     }
 
     def run(self, target: str) -> ScanModuleResult:
-        result = fetch(target)
-        if isinstance(result, FetchError):
+        # Only the target's own scope is ever fetched: a redirect elsewhere
+        # is not followed, and nothing from another site is attributed here.
+        result = fetch(target, scope=RequestScope.for_target(target))
+        if isinstance(result, (FetchError, ScopeRejection)):
             return ScanModuleResult(module=self.name, error=result.reason)
 
         detected: dict[str, dict] = {}

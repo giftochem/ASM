@@ -8,7 +8,7 @@ import re
 
 from app.core.enums import AssetType, FindingSeverity
 from app.scanners.base import ScanFinding, ScanModuleResult, ScannerModule
-from app.scanners.http_client import FetchError, fetch
+from app.scanners.http_client import FetchError, RequestScope, ScopeRejection, fetch
 
 _HSTS_MIN_MAX_AGE = 15768000  # ~6 months, a common minimum recommendation
 _WEAK_CSP_TOKENS = ("unsafe-inline", "unsafe-eval", "*")
@@ -35,8 +35,10 @@ class HeadersModule(ScannerModule):
     }
 
     def run(self, target: str) -> ScanModuleResult:
-        result = fetch(target)
-        if isinstance(result, FetchError):
+        # Only the target's own scope is ever fetched: a redirect elsewhere
+        # is not followed, and nothing from another site is attributed here.
+        result = fetch(target, scope=RequestScope.for_target(target))
+        if isinstance(result, (FetchError, ScopeRejection)):
             return ScanModuleResult(module=self.name, error=result.reason)
 
         headers = {k.lower(): v for k, v in result.headers.items()}

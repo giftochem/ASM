@@ -4,7 +4,7 @@ from app.scanners.http_client import FetchError, FetchResult
 
 
 def _fake_fetch(monkeypatch, result):
-    monkeypatch.setattr("app.scanners.headers_module.fetch", lambda target: result)
+    monkeypatch.setattr("app.scanners.headers_module.fetch", lambda target, *, scope: result)
 
 
 _GOOD_HEADERS = {
@@ -119,7 +119,7 @@ def test_csp_frame_ancestors_covers_missing_x_frame_options(monkeypatch):
 
 def test_fetch_error_is_reported_as_module_error(monkeypatch):
     monkeypatch.setattr(
-        "app.scanners.headers_module.fetch", lambda target: FetchError("blocked target")
+        "app.scanners.headers_module.fetch", lambda target, *, scope: FetchError("blocked target")
     )
     module_result = HeadersModule().run("example.com")
     assert module_result.error is not None
