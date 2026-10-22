@@ -101,6 +101,21 @@ integration — those are separate, not-yet-scoped work.
 docker compose -p asm-prod -f docker-compose.prod.yml up -d --build
 ```
 
+**Run this from the root of the checkout** (the directory containing
+`docker-compose.prod.yml`), like every command in this guide. The backend
+Dockerfile (`docker/backend/Dockerfile`) sits outside its build context
+(`backend/`), and current Docker Compose builds through `buildx bake`,
+which won't read a Dockerfile outside the directory Compose was started
+from. From the checkout root the build succeeds. Started from a
+directory that doesn't contain that Dockerfile — for example another
+directory, with `-f <checkout>/docker-compose.prod.yml` or
+`--project-directory`, or `backend/` — it stops before building anything
+with
+`additional privileges requested: pass "--allow=fs.read=…Dockerfile"`
+(seen with Compose v5.6.0 and buildx v0.38.0). `cd` to the checkout root
+and run the same command; don't disable Docker's filesystem check to get
+around it. The development `docker-compose.yml` builds the same way.
+
 The explicit `-p asm-prod` matters if `docker-compose.yml`'s dev stack
 might ever be running on the same host: Compose's project name defaults
 to the directory name regardless of which `-f` file you pass, so without

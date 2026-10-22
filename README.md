@@ -1701,6 +1701,12 @@ and read the deployment guide before exposing it to any network:
 self-registration is open and the certificate is a local-testing
 placeholder.
 
+Run these commands, and the development ones above, from the root of the
+checkout. With current Docker Compose, an image build started from
+another directory (or from `backend/`) can stop with
+`additional privileges requested: pass "--allow=fs.read=…Dockerfile"`;
+see "Running it" in [`docs/deployment.md`](docs/deployment.md#running-it).
+
 ### Authentication (cookie-based — see docs/auth-cookie-model.md)
 
 Tokens are delivered as `httpOnly` cookies, never in the response body —
@@ -2274,20 +2280,31 @@ accuracy, and a dependency/security scan.
 
 ## Latest full test run
 
-These are the counts from the last verified local runs — a record, not
-an automated guarantee (CI runs secret scanning only). Re-run the suites
-before relying on them.
+These are the counts from the last verified runs — a record, not an
+automated guarantee. They were run locally on a developer machine
+(Windows, Docker Desktop), not by GitHub: CI runs secret scanning
+(Gitleaks) only, not these suites. Re-run them before relying on them.
 
 ```
-docker compose run --rm app pytest        # last full run: 2026-10-21, redirect-scope fix
+docker compose run --rm app pytest        # 2026-10-21, commit 1c3c775
 ================= 1192 passed, 1 skipped, 0 failed =================
 
-cd frontend && npx vitest run             # last full run: commit 5d6848b
+cd frontend && npm test                   # 2026-10-21, commit 1c3c775
 ================= 51 test files, 424 tests passed =================
 
-cd frontend && npm run build              # last run: commit 5d6848b
+cd frontend && npm run typecheck          # 2026-10-21, commit 1c3c775
+================= tsc --noEmit -- passes =================
+
+cd frontend && npm run build              # 2026-10-21, commit 1c3c775
 ================= tsc --noEmit && vite build -- succeeds =================
+
+sh docker/nginx/test-routing.sh           # 2026-10-21, commit 1c3c775
+================= 42 checks -- all routing checks passed =================
 ```
+
+The backend suite ran in the development stack against the code
+committed as `1c3c775`. The frontend checks (after `npm ci`) and the
+routing test ran on a clean export of `1c3c775`.
 
 The backend count includes `tests/test_http_redirect_scope.py` (53
 tests), added with the redirect authorization-scope fix.

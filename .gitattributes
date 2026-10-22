@@ -1,0 +1,5 @@
+# Shell scripts keep LF line endings in every checkout and `git archive`
+# export, whatever core.autocrlf says: a Linux/macOS sh rejects CRLF
+# ("set: illegal option -"). Only *.sh is pinned; every other file keeps
+# its existing line-ending behavior.
+*.sh text eol=lf

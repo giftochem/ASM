@@ -127,8 +127,10 @@ services:
       asm_net:
         # Static IP so app/config.py's TRUSTED_PROXY_IPS_RAW can name it
         # deterministically -- see app/core/client_ip.py for why an
-        # unlisted (untrusted) proxy peer is the safe default, and
-        # docs/deployment.md for setting this value in .env.
+        # unlisted (untrusted) proxy peer is the safe default. That value
+        # is hardcoded on `app` above, never set in .env -- the same
+        # reasoning that pins ENVIRONMENT: production on app and worker
+        # (docs/deployment.md, one-time setup steps 3 and 4).
         ipv4_address: 172.28.0.10
 
 networks:
