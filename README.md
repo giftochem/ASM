@@ -34,6 +34,28 @@ This is a **two-layer** guardrail, not just a create-time check:
 Neither check can be bypassed through the API. The confirming/revoking
 user and timestamp are recorded on the asset and in the audit log.
 
+**Hostname and descendant scope.** For `domain`, `subdomain` and `url`
+assets, the authorized scope is the asset's hostname *and every hostname
+under it* (`example.com` covers `www.example.com` and
+`api.dev.example.com`). The `http` discovery provider and the
+security-headers and technology scan modules can follow redirects to
+any of those descendant hostnames; a redirect anywhere else is refused
+before the destination is resolved or connected to. This release has no
+exact-hostname-only mode for these redirect-following operations.
+Discovered candidate assets are never authorized automatically just
+because their names fall inside a seed's scope.
+
+Your permission must cover every destination an operation is allowed to
+contact. If it covers only the exact hostname, don't run HTTP
+discovery, security-headers scans or technology scans on that asset.
+This matters most for project hostnames on a shared-hosting domain (for
+example a project under `vercel.app`): authorizing your project's
+hostname never extends to other hosted projects or to the provider's
+shared infrastructure. The `certificate` discovery provider makes
+exactly one TLS connection, to the asset's hostname on port 443; it
+follows no HTTP redirects and never contacts the names in the
+certificate's SAN list.
+
 ## Status: local self-hosted beta (release candidate)
 
 ASM is a beta you run yourself, on your own machine, with Docker Compose.
